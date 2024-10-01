@@ -2,3 +2,6 @@
 *.a
 main
 .cache/
+lib/
+x64/
+.vs/
