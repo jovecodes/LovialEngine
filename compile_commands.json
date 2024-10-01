@@ -1,0 +1,17 @@
+[
+  {
+    "arguments": [
+      "/usr/bin/g++",
+      "-c",
+      "-I../NewJovialEngine/src",
+      "-Ilua/src",
+      "-ggdb",
+      "-o",
+      "main",
+      "./main.cpp"
+    ],
+    "directory": "/home/jove/Code/LuaTest",
+    "file": "/home/jove/Code/LuaTest/main.cpp",
+    "output": "/home/jove/Code/LuaTest/main"
+  }
+]
