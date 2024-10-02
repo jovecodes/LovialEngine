@@ -1,13 +1,18 @@
 #include "Input/Input.h"
+#include "Rendering/2D/Text.h"
+#include "Rendering/Shader.h"
 #include "lua.hpp"
 #include "Jovial.h"
 #include "Window.h"
 #include "Util/Systems.h"
 #include "OS/FileAccess.h"
+#include "Util/JovialFont.h"
 
 using namespace jovial;
 
-Arena lua_systems_arena;
+PixelFont default_font;
+Arena static_arena;
+Arena frame_arena;
 
 struct LuaSystem {
     int func_ref = 0;
@@ -51,46 +56,33 @@ int lua_push_system(lua_State *L) {
     lua_pushvalue(L, 2);  // Push the function to the top of the stack
     int lua_func_ref = luaL_ref(L, LUA_REGISTRYINDEX);  // Get the reference to the Lua function
 
-    LuaSystem *system = New(lua_systems_arena, LuaSystem{lua_func_ref, L});
+    LuaSystem *system = New(static_arena, LuaSystem{lua_func_ref, L});
 
     WM::get_main_window()->get_viewport()->push_system(type, on_event, system);
 
     return 0;  // No return value to Lua
 }
 
-int rect_from_table(lua_State *L, Rect2 *rect, int offset) {
-    // Get the 'position' table
-    lua_getfield(L, 1, "position");
-    if (lua_istable(L, -1)) {
-        lua_getfield(L, -1, "x");
-        rect->position.x = luaL_checknumber(L, -1);  
-        lua_pop(L, 1); 
+#define load_v2(L, vector, name, arg)                                                \
+    do {                                                                             \
+    lua_getfield(L, arg, name);                                                      \
+    if (lua_istable(L, -1)) {                                                        \
+        lua_getfield(L, -1, "x");                                                    \
+        vector.x = luaL_checknumber(L, -1);                                          \
+        lua_pop(L, 1);                                                               \
+                                                                                     \
+        lua_getfield(L, -1, "y");                                                    \
+        vector.y = luaL_checknumber(L, -1);                                          \
+        lua_pop(L, 1);                                                               \
+    } else {                                                                         \
+        return luaL_error(L, "'" #vector "' must be a table {x: number, y: number}");\
+    }                                                                                \
+    lua_pop(L, 1);                                                                   \
+    } while(0)
 
-        lua_getfield(L, -1, "y");
-        rect->position.y = luaL_checknumber(L, -1);  
-        lua_pop(L, 1);
-    } else {
-        return luaL_error(L, "'position' must be a table {x: number, y: number}");
-    }
-    lua_pop(L, 1);  // Pop the 'position' table
-
-    // Get the 'position' table
-    lua_getfield(L, 1, "size");
-    if (lua_istable(L, -1)) {
-        lua_getfield(L, -1, "x");
-        rect->size.x = luaL_checknumber(L, -1);  
-        lua_pop(L, 1); 
-
-        lua_getfield(L, -1, "y");
-        rect->size.y = luaL_checknumber(L, -1);  
-        lua_pop(L, 1);
-    } else {
-        return luaL_error(L, "'size' must be a table {x: number, y: number}");
-    }
-    lua_pop(L, 1);  // Pop the 'size' table
-    
-    return 0;
-}
+#define load_rect2(L, rect, arg) \
+    load_v2(L, rect.position, "position", arg); \
+    load_v2(L, rect.size, "size", arg);
 
 void color_from_object(Color &result, lua_State *L) {
     if (lua_isnil(L, -1)) {
@@ -134,16 +126,100 @@ int lua_load_texture(lua_State *L) {
     return 1;
 }
 
+int lua_load_shader(lua_State *L) {
+    StrView vertex, fragment;
+
+    if (lua_isnil(L, 1)) {
+        vertex = Renderer2D::vertex_shader_code();
+    } else if (lua_isstring(L, 1)) {
+        u64 size = 0;
+        const char *pointer = luaL_checklstring(L, 1, &size);
+        vertex = {pointer, size};
+    } else {
+        return luaL_error(L, "Expected a string (path to the vertex shader) as the first argument");
+    }
+
+    if (lua_isnil(L, 1)) {
+        fragment = Renderer2D::fragment_shader_code();
+    } else if (lua_isstring(L, 1)) {
+        u64 size = 0;
+        const char *pointer = luaL_checklstring(L, 1, &size);
+        fragment = {pointer, size};
+    } else {
+        return luaL_error(L, "Expected a string (path to the fragment shader) as the second argument");
+    }
+
+    Shader shader = Shader::from_path(vertex, fragment);
+
+    auto *r2d = Renderer2D::from(WM::get_main_window()->get_renderers()[0]);
+    r2d->add_shader(shader);
+
+    lua_pushinteger(L, shader.id);
+
+    return 1;
+}
+
+int lua_draw_line(lua_State *L) {
+    if (!lua_istable(L, 1)) {
+        return luaL_error(L, "Expected a table {start = v2(), end = v2(), color = {}, thickness = 1.0, z_index = 0} as the first argument");
+    }
+
+    Line2DCmd cmd;
+
+    load_v2(L, cmd.start, "start", 1);
+    load_v2(L, cmd.end, "finish", 1);
+
+    lua_getfield(L, 1, "color");
+    color_from_object(cmd.color, L);
+
+    lua_getfield(L, 1, "thickness");  
+    cmd.thickness = luaL_optnumber(L, -1, 1.0);  
+    lua_pop(L, 1);  
+
+    lua_getfield(L, 1, "z_index");  
+    int z_index = luaL_optnumber(L, -1, 0.0);  
+    lua_pop(L, 1);  
+
+    cmd.draw(WM::get_main_window()->get_renderers()[0], z_index);
+    return 0;
+}
+
+int lua_draw_text(lua_State *L) {
+    if (!lua_istable(L, 1)) {
+        return luaL_error(L, "Expected a table {text = 'Hello, World', position = v2(), color = {}, z_index = 0} as the first argument");
+    }
+
+    Text2DCmd cmd;
+    cmd.bitmap_font = &default_font;
+
+    load_v2(L, cmd.position, "position", 1);
+
+    lua_getfield(L, 1, "text");
+    size_t len = 0;
+    const char *text = luaL_checklstring(L, -1, &len);
+    cmd.text = String(frame_arena, {text, len}).to_upper();
+
+    lua_getfield(L, 1, "color");
+    color_from_object(cmd.color, L);
+
+    lua_getfield(L, 1, "z_index");  
+    int z_index = luaL_optnumber(L, -1, 0.0);  
+    lua_pop(L, 1);  
+
+    cmd.draw(WM::get_main_window()->get_renderers()[0], z_index);
+    return 0;
+
+}
+
 int lua_draw_rect2(lua_State *L) {
     if (!lua_istable(L, 1)) {
-        return luaL_error(L, "Expected a table {x: 0, y: 0, width: 0, height: 0, color: {}, z_index: 0} as the first argument");
+        return luaL_error(L, "Expected a table {position = v2(), size = v2(), color = {}, z_index = 0} as the first argument");
     }
 
     Rect2DCmd cmd;
 
     Rect2 rect;
-    int error = rect_from_table(L, &rect, 1);
-    if (error) return error;
+    load_rect2(L, rect, 1);
     cmd.set(rect);
 
     lua_getfield(L, 1, "color");
@@ -159,36 +235,20 @@ int lua_draw_rect2(lua_State *L) {
 
 int lua_draw_sprite(lua_State *L) {
     if (!lua_istable(L, 1)) {
-        return luaL_error(L, "Expected a table {position: {x: 0, y: 0}, texture: 0, color: {}, scale: {x: 1, y: 1}, rotation: 0, z_index: 0} as the first argument");
+        return luaL_error(L, "Expected a table {position = {x = 0, y = 0}, texture = 0, color = {}, scale = {x = 1, y = 1}, rotation = 0, z_index = 0} as the first argument");
     }
 
     Sprite2DCmd cmd;
 
-    // Get the 'position' table
-    lua_getfield(L, 1, "position");
-    if (lua_istable(L, -1)) {
-        lua_getfield(L, -1, "x");
-        cmd.position.x = luaL_checknumber(L, -1);  
-        lua_pop(L, 1); 
+    load_v2(L, cmd.position, "position", 1);
 
-        lua_getfield(L, -1, "y");
-        cmd.position.y = luaL_checknumber(L, -1);  
-        lua_pop(L, 1);
-    } else {
-        return luaL_error(L, "'position' must be a table {x: number, y: number}");
-    }
-    lua_pop(L, 1);  // Pop the 'position' table
-
-    // Get the 'texture'
     lua_getfield(L, 1, "texture");
-    cmd.texture.id = luaL_checknumber(L, -1);
+    cmd.texture.id = luaL_checkinteger(L, -1);
     lua_pop(L, 1);
 
-    // Get the 'color' table and extract color values
     lua_getfield(L, 1, "color");
     color_from_object(cmd.color, L);
 
-    // Get the 'scale' table
     lua_getfield(L, 1, "scale");
     if (lua_istable(L, -1)) {
         lua_getfield(L, -1, "x");
@@ -199,22 +259,40 @@ int lua_draw_sprite(lua_State *L) {
         cmd.scale.y = luaL_optnumber(L, -1, 1.0);  
         lua_pop(L, 1);
     } else {
-        cmd.scale = {1.0f, 1.0f};  // Default scale if not provided
+        cmd.scale = {1.0f, 1.0f};  
     }
-    lua_pop(L, 1);  // Pop the 'scale' table
+    lua_pop(L, 1);  
 
-    // Get 'rotation'
     lua_getfield(L, 1, "rotation");  
     cmd.rotation = luaL_optnumber(L, -1, 0.0);  
     lua_pop(L, 1);
 
-    // Get 'z_index'
     lua_getfield(L, 1, "z_index");  
     int z_index = luaL_optnumber(L, -1, 0);  
     lua_pop(L, 1);  
 
-    // Draw the sprite
-    cmd.draw(WM::get_main_window()->get_renderers()[0], z_index);
+    lua_getfield(L, 1, "shader");
+    int shader_id = luaL_optinteger(L, -1, -1);
+    lua_pop(L, 1);
+
+    auto &renderer = WM::get_main_window()->get_renderers()[0];
+    if (shader_id != -1) {
+        JV_LOG_ENGINE(LOG_WARNING, "Shaders are not yet implemented for lua. Sorry, too lazy.");
+        // Sequence2DCmd seq;
+        //
+        // Shader2DCmd shader;
+        // shader.id = shader_id;
+        //
+        // seq.push(shader.draw(renderer, 2));
+        // seq.push(cmd.draw(renderer, 1));
+        //
+        // shader = {};
+        // seq.push(shader.draw(renderer, 0));
+        //
+        // seq.draw(renderer, z_index);
+    }
+
+    cmd.draw(renderer, 0);
     return 0;
 }
 
@@ -452,9 +530,43 @@ int lua_v2_div(lua_State *L) {
 }
 
 int lua_v2_normalize(lua_State *L) {
-    float x = luaL_checknumber(L, 1);
-    float y = luaL_checknumber(L, 2);
+    lua_getfield(L, 1, "x");
+    float x = luaL_checknumber(L, -1);
+    lua_getfield(L, 1, "y");
+    float y = luaL_checknumber(L, -1);
+    lua_pop(L, 2);
+
     push_v2(L, Vector2(x, y).normalized());
+    return 1;
+}
+
+int lua_v2_length(lua_State *L) {
+    lua_getfield(L, 1, "x");
+    float x = luaL_checknumber(L, -1);
+    lua_getfield(L, 1, "y");
+    float y = luaL_checknumber(L, -1);
+    lua_pop(L, 2);
+
+    lua_pushinteger(L, Vector2(x, y).length());
+    return 1;
+}
+
+int lua_v2_angle(lua_State *L) {
+    lua_getfield(L, 1, "x");
+    float x = luaL_checknumber(L, -1);
+    lua_getfield(L, 1, "y");
+    float y = luaL_checknumber(L, -1);
+    lua_pop(L, 2);
+
+    lua_pushinteger(L, Vector2(x, y).angle());
+    return 1;
+}
+
+int lua_rectangles_overlap(lua_State *L) {
+    Rect2 a, b;
+    load_rect2(L, a, 1);
+    load_rect2(L, b, 1);
+    lua_pushboolean(L, a.intersects(b));
     return 1;
 }
 
@@ -502,6 +614,12 @@ int lua_is_pressed(lua_State *L) {
     return 1;
 }
 
+int lua_is_typed(lua_State *L) {
+    int action = luaL_checkinteger(L, 1);
+    lua_pushboolean(L, Input::is_typed((Actions) action));
+    return 1;
+}
+
 int lua_is_just_pressed(lua_State *L) {
     int action = luaL_checkinteger(L, 1);
     lua_pushboolean(L, Input::is_just_pressed((Actions) action));
@@ -514,6 +632,12 @@ int lua_is_just_released(lua_State *L) {
     return 1;
 }
 
+int lua_string_typed(lua_State *L) {
+    View<char> chars = Input::get_chars_typed();
+    lua_pushlstring(L, chars.ptr(), chars.size());
+    return 1;
+}
+
 int lua_delta(lua_State *L) {
     lua_pushnumber(L, Time::delta());
     return 1;
@@ -522,8 +646,10 @@ int lua_delta(lua_State *L) {
 void bind_input_to_lua(lua_State *L) {
     lua_newtable(L);
     lua_pushcfunction(L, lua_is_pressed); lua_setfield(L, -2, "is_pressed");
+    lua_pushcfunction(L, lua_is_typed); lua_setfield(L, -2, "is_typed");
     lua_pushcfunction(L, lua_is_just_pressed); lua_setfield(L, -2, "is_just_pressed");
     lua_pushcfunction(L, lua_is_just_released); lua_setfield(L, -2, "is_just_released");
+    lua_pushcfunction(L, lua_string_typed); lua_setfield(L, -2, "string_typed");
     lua_pushcfunction(L, lua_get_axis); lua_setfield(L, -2, "get_axis");
     lua_pushcfunction(L, lua_get_direction); lua_setfield(L, -2, "get_direction");
     lua_pushcfunction(L, lua_mouse_position); lua_setfield(L, -2, "mouse_position");
@@ -552,8 +678,11 @@ lua_State *init(int argc, char **argv) {
 
     bind_function(L, "push_system", lua_push_system);
     bind_function(L, "draw_rect2", lua_draw_rect2);
+    bind_function(L, "draw_line", lua_draw_line);
+    bind_function(L, "draw_text", lua_draw_text);
     bind_function(L, "draw_sprite", lua_draw_sprite);
     bind_function(L, "load_texture", lua_load_texture);
+    bind_function(L, "load_shader", lua_load_shader);
     bind_function(L, "include", lua_include);
 
     bind_function(L, "v2", lua_v2);
@@ -562,6 +691,10 @@ lua_State *init(int argc, char **argv) {
     bind_function(L, "v2_mul", lua_v2_mul);
     bind_function(L, "v2_div", lua_v2_div);
     bind_function(L, "v2_normalize", lua_v2_normalize);
+    bind_function(L, "v2_length", lua_v2_length);
+    bind_function(L, "v2_angle", lua_v2_angle);
+
+    bind_function(L, "rectangles_overlap", lua_rectangles_overlap);
 
     bind_event_ids_to_lua(L);
     bind_input_actions_to_lua(L);
@@ -607,7 +740,7 @@ bool load_config(int argc, char **argv, WindowProps &window_props) {
     if (lua_isstring(L, -1)) {
         const char *title = lua_tostring(L, -1);
         StrView view = title;
-        window_props.title = view.cstr(lua_systems_arena);
+        window_props.title = view.cstr(static_arena);
     }
     lua_pop(L, 1);
 
@@ -658,6 +791,10 @@ bool load_config(int argc, char **argv, WindowProps &window_props) {
     return true;
 }
 
+void clear_frame_arena(Events::PreUpdate &) {
+    frame_arena.reset();
+}
+
 #ifdef _WIN32
 #include <Windows.h>
 
@@ -676,6 +813,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     load_config(argc, (char **) argv, props);
     systems2d(game, props);
+    game.push_system(clear_frame_arena);
+    load_jovial_font(&default_font);
 
     lua_State* L = init(argc, (char**) argv);
     if (!L) return -1;
@@ -699,6 +838,8 @@ int main(int argc, char **argv) {
     };
     load_config(argc, argv, props);
     systems2d(game, props);
+    game.push_system(clear_frame_arena);
+    load_jovial_font(&default_font);
 
     lua_State *L = init(argc, argv);
     if (!L) return -1;
