@@ -606,7 +606,8 @@ bool load_config(int argc, char **argv, WindowProps &window_props) {
     lua_getfield(L, -1, "window_title");
     if (lua_isstring(L, -1)) {
         const char *title = lua_tostring(L, -1);
-        window_props.title = title;
+        StrView view = title;
+        window_props.title = view.cstr(lua_systems_arena);
     }
     lua_pop(L, 1);
 
@@ -657,6 +658,38 @@ bool load_config(int argc, char **argv, WindowProps &window_props) {
     return true;
 }
 
+#ifdef _WIN32
+#include <Windows.h>
+
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    Jovial game;
+    WindowProps props{
+        .size = {1280, 720},
+        .title = "My Jovial Game",
+        .bg = Colors::GRUVBOX_GREY,
+    };
+
+    // Parse command line arguments
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return -1;
+
+    load_config(argc, (char **) argv, props);
+    systems2d(game, props);
+
+    lua_State* L = init(argc, (char**) argv);
+    if (!L) return -1;
+
+    game.run();
+
+    // Free the memory allocated by CommandLineToArgvW
+    LocalFree(argv);
+
+    return 0;
+
+}
+#else
+
 int main(int argc, char **argv) {
     Jovial game;
     WindowProps props{
@@ -673,3 +706,5 @@ int main(int argc, char **argv) {
     game.run();
     return 0;
 }
+
+#endif
