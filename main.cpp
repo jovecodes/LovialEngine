@@ -1,3 +1,4 @@
+#include "Input/Input.h"
 #include "lua.hpp"
 #include "Jovial.h"
 #include "Window.h"
@@ -57,29 +58,38 @@ int lua_push_system(lua_State *L) {
     return 0;  // No return value to Lua
 }
 
-Rect2 rect_from_table(lua_State *L, int offset) {
-    Rect2 rect;
-    
-    lua_getfield(L, offset, "x");  
-    rect.position.x = luaL_checknumber(L, -1);  
-    lua_pop(L, 1);  
+int rect_from_table(lua_State *L, Rect2 *rect, int offset) {
+    // Get the 'position' table
+    lua_getfield(L, 1, "position");
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, "x");
+        rect->position.x = luaL_checknumber(L, -1);  
+        lua_pop(L, 1); 
 
-    
-    lua_getfield(L, offset, "y");
-    rect.position.y = luaL_checknumber(L, -1);
-    lua_pop(L, 1);  
+        lua_getfield(L, -1, "y");
+        rect->position.y = luaL_checknumber(L, -1);  
+        lua_pop(L, 1);
+    } else {
+        return luaL_error(L, "'position' must be a table {x: number, y: number}");
+    }
+    lua_pop(L, 1);  // Pop the 'position' table
 
-    
-    lua_getfield(L, offset, "width");
-    rect.size.width = luaL_checknumber(L, -1);
-    lua_pop(L, 1);  
+    // Get the 'position' table
+    lua_getfield(L, 1, "size");
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, "x");
+        rect->size.x = luaL_checknumber(L, -1);  
+        lua_pop(L, 1); 
 
+        lua_getfield(L, -1, "y");
+        rect->size.y = luaL_checknumber(L, -1);  
+        lua_pop(L, 1);
+    } else {
+        return luaL_error(L, "'size' must be a table {x: number, y: number}");
+    }
+    lua_pop(L, 1);  // Pop the 'size' table
     
-    lua_getfield(L, offset, "height");
-    rect.size.height = luaL_checknumber(L, -1);
-    lua_pop(L, 1);  
-
-    return rect;
+    return 0;
 }
 
 void color_from_object(Color &result, lua_State *L) {
@@ -131,7 +141,11 @@ int lua_draw_rect2(lua_State *L) {
 
     Rect2DCmd cmd;
 
-    cmd.set(rect_from_table(L, 1));
+    Rect2 rect;
+    int error = rect_from_table(L, &rect, 1);
+    if (error) return error;
+    cmd.set(rect);
+
     lua_getfield(L, 1, "color");
     color_from_object(cmd.color, L);
 
@@ -145,42 +159,61 @@ int lua_draw_rect2(lua_State *L) {
 
 int lua_draw_sprite(lua_State *L) {
     if (!lua_istable(L, 1)) {
-        return luaL_error(L, "Expected a table {x: 0, y: 0, width: 0, height: 0, color: {}, z_index: 0} as the first argument");
+        return luaL_error(L, "Expected a table {position: {x: 0, y: 0}, texture: 0, color: {}, scale: {x: 1, y: 1}, rotation: 0, z_index: 0} as the first argument");
     }
 
     Sprite2DCmd cmd;
 
-    lua_getfield(L, 1, "x");  
-    cmd.position.x = luaL_checknumber(L, -1);  
-    lua_pop(L, 1);  
+    // Get the 'position' table
+    lua_getfield(L, 1, "position");
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, "x");
+        cmd.position.x = luaL_checknumber(L, -1);  
+        lua_pop(L, 1); 
 
-    lua_getfield(L, 1, "y");
-    cmd.position.y = luaL_checknumber(L, -1);
-    lua_pop(L, 1);  
+        lua_getfield(L, -1, "y");
+        cmd.position.y = luaL_checknumber(L, -1);  
+        lua_pop(L, 1);
+    } else {
+        return luaL_error(L, "'position' must be a table {x: number, y: number}");
+    }
+    lua_pop(L, 1);  // Pop the 'position' table
 
+    // Get the 'texture'
     lua_getfield(L, 1, "texture");
     cmd.texture.id = luaL_checknumber(L, -1);
-    lua_pop(L, 1);  
+    lua_pop(L, 1);
 
+    // Get the 'color' table and extract color values
     lua_getfield(L, 1, "color");
     color_from_object(cmd.color, L);
 
-    lua_getfield(L, 1, "scaleX");  
-    cmd.scale.x = luaL_optnumber(L, -1, 1.0);  
-    lua_pop(L, 1);  
+    // Get the 'scale' table
+    lua_getfield(L, 1, "scale");
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, "x");
+        cmd.scale.x = luaL_optnumber(L, -1, 1.0);  
+        lua_pop(L, 1);  
 
-    lua_getfield(L, 1, "scaleY");  
-    cmd.scale.y = luaL_optnumber(L, -1, 1.0);  
-    lua_pop(L, 1);  
+        lua_getfield(L, -1, "y");
+        cmd.scale.y = luaL_optnumber(L, -1, 1.0);  
+        lua_pop(L, 1);
+    } else {
+        cmd.scale = {1.0f, 1.0f};  // Default scale if not provided
+    }
+    lua_pop(L, 1);  // Pop the 'scale' table
 
+    // Get 'rotation'
     lua_getfield(L, 1, "rotation");  
     cmd.rotation = luaL_optnumber(L, -1, 0.0);  
-    lua_pop(L, 1);  
+    lua_pop(L, 1);
 
+    // Get 'z_index'
     lua_getfield(L, 1, "z_index");  
-    int z_index = luaL_optnumber(L, -1, 0.0);  
+    int z_index = luaL_optnumber(L, -1, 0);  
     lua_pop(L, 1);  
 
+    // Draw the sprite
     cmd.draw(WM::get_main_window()->get_renderers()[0], z_index);
     return 0;
 }
@@ -360,6 +393,109 @@ void bind_input_actions_to_lua(lua_State *L) {
     lua_setglobal(L, "Actions");
 }
 
+void get_v2_op_args(Vector2 *lhs, Vector2 *rhs, lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    luaL_checktype(L, 2, LUA_TTABLE);
+
+    lua_getfield(L, 1, "x");
+    lhs->x = luaL_checknumber(L, -1);
+    lua_getfield(L, 1, "y");
+    lhs->y = luaL_checknumber(L, -1);
+    lua_pop(L, 2);
+
+    lua_getfield(L, 2, "x");
+    rhs->x = luaL_checknumber(L, -1);
+    lua_getfield(L, 2, "y");
+    rhs->y = luaL_checknumber(L, -1);
+    lua_pop(L, 2);
+}
+
+void push_v2(lua_State *L, const Vector2 &vector) {
+    lua_newtable(L);
+    lua_pushnumber(L, vector.x); lua_setfield(L, -2, "x");
+    lua_pushnumber(L, vector.y); lua_setfield(L, -2, "y");
+}
+
+int lua_v2(lua_State *L) {
+    float x = luaL_checknumber(L, 1);
+    float y = luaL_optnumber(L, 2, x); // default to same as x so you can go: v2(1)
+    push_v2(L, {x, y});
+    return 1;
+}
+
+int lua_v2_add(lua_State *L) {
+    Vector2 lhs, rhs;
+    get_v2_op_args(&lhs, &rhs, L);
+    push_v2(L, lhs + rhs);
+    return 1;
+}
+
+int lua_v2_sub(lua_State *L) {
+    Vector2 lhs, rhs;
+    get_v2_op_args(&lhs, &rhs, L);
+    push_v2(L, lhs - rhs);
+    return 1;
+}
+
+int lua_v2_mul(lua_State *L) {
+    Vector2 lhs, rhs;
+    get_v2_op_args(&lhs, &rhs, L);
+    push_v2(L, lhs * rhs);
+    return 1;
+}
+
+int lua_v2_div(lua_State *L) {
+    Vector2 lhs, rhs;
+    get_v2_op_args(&lhs, &rhs, L);
+    push_v2(L, lhs / rhs);
+    return 1;
+}
+
+int lua_v2_normalize(lua_State *L) {
+    float x = luaL_checknumber(L, 1);
+    float y = luaL_checknumber(L, 2);
+    push_v2(L, Vector2(x, y).normalized());
+    return 1;
+}
+
+int lua_get_axis(lua_State *L) {
+    int negitive = luaL_checkinteger(L, 1);
+    int positive = luaL_checkinteger(L, 2);
+    lua_pushnumber(L, Input::get_axis((Actions) negitive, (Actions) positive));
+    return 1;
+}
+
+int lua_get_direction(lua_State *L) {
+    if (!lua_istable(L, 1)) {
+        return luaL_error(L, "{up: Actions.W, left: Actions.A, down: Actions.S, right: Actions.D} as the first argument");
+    }
+
+    lua_getfield(L, 1, "left");
+    Actions left = (Actions) luaL_checkinteger(L, -1);
+
+    lua_getfield(L, 1, "right");
+    Actions right = (Actions) luaL_checkinteger(L, -1);
+
+    lua_getfield(L, 1, "up");
+    Actions up = (Actions) luaL_checkinteger(L, -1);
+
+    lua_getfield(L, 1, "down");
+    Actions down = (Actions) luaL_checkinteger(L, -1);
+
+    push_v2(L, Input::get_direction(up, down, left, right));
+    return 1;
+}
+
+int lua_mouse_position(lua_State *L) {
+    push_v2(L, Input::get_mouse_position());
+    return 1;
+}
+
+int lua_mouse_delta(lua_State *L) {
+    push_v2(L, Input::get_mouse_delta());
+    return 1;
+}
+
 int lua_is_pressed(lua_State *L) {
     int action = luaL_checkinteger(L, 1);
     lua_pushboolean(L, Input::is_pressed((Actions) action));
@@ -388,6 +524,10 @@ void bind_input_to_lua(lua_State *L) {
     lua_pushcfunction(L, lua_is_pressed); lua_setfield(L, -2, "is_pressed");
     lua_pushcfunction(L, lua_is_just_pressed); lua_setfield(L, -2, "is_just_pressed");
     lua_pushcfunction(L, lua_is_just_released); lua_setfield(L, -2, "is_just_released");
+    lua_pushcfunction(L, lua_get_axis); lua_setfield(L, -2, "get_axis");
+    lua_pushcfunction(L, lua_get_direction); lua_setfield(L, -2, "get_direction");
+    lua_pushcfunction(L, lua_mouse_position); lua_setfield(L, -2, "mouse_position");
+    lua_pushcfunction(L, lua_mouse_delta); lua_setfield(L, -2, "mouse_delta");
     lua_setglobal(L, "Input");
 }
 
@@ -415,6 +555,14 @@ lua_State *init(int argc, char **argv) {
     bind_function(L, "draw_sprite", lua_draw_sprite);
     bind_function(L, "load_texture", lua_load_texture);
     bind_function(L, "include", lua_include);
+
+    bind_function(L, "v2", lua_v2);
+    bind_function(L, "v2_add", lua_v2_add);
+    bind_function(L, "v2_sub", lua_v2_sub);
+    bind_function(L, "v2_mul", lua_v2_mul);
+    bind_function(L, "v2_div", lua_v2_div);
+    bind_function(L, "v2_normalize", lua_v2_normalize);
+
     bind_event_ids_to_lua(L);
     bind_input_actions_to_lua(L);
     bind_input_to_lua(L);
