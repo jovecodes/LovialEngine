@@ -10,9 +10,24 @@
 
 using namespace jovial;
 
+#define ERROR_LOG_PATH "./error_log.txt"
+
 PixelFont default_font;
 Arena static_arena;
 Arena frame_arena;
+
+static bool has_errored = false;
+
+#define LOG_ERROR(...)                                          \
+    do {                                                        \
+        if (!has_errored) {                                     \
+            fs::write_file(ERROR_LOG_PATH, "");                 \
+            has_errored = true;                                 \
+        }                                                       \
+        fs::append_file(ERROR_LOG_PATH, tprint(__VA_ARGS__));   \
+        fs::append_file(ERROR_LOG_PATH, "\n");                  \
+        JV_LOG_ENGINE(LOG_ERROR, __VA_ARGS__);                  \
+    } while (0)
 
 struct LuaSystem {
     int func_ref = 0;
@@ -40,7 +55,7 @@ void on_event(void *user_data, Event &event) {
     }
 
     if (lua_pcall(system->L, 1, 0, 0) != LUA_OK) {
-        JV_LOG_ENGINE(LOG_ERROR, "Error calling Lua callback: %", lua_tostring(system->L, -1));
+        LOG_ERROR("ERROR: could not call Lua callback: %\n", lua_tostring(system->L, -1));
     }
 }
 
@@ -672,7 +687,7 @@ lua_State *init(int argc, char **argv) {
     
     int status = luaL_loadfile(L, program);
     if (status) {
-        fprintf(stderr, "Couldn't load file: %s\n", lua_tostring(L, -1));
+        LOG_ERROR("Couldn't load file: %", lua_tostring(L, -1));
         return nullptr;
     }
 
@@ -703,7 +718,7 @@ lua_State *init(int argc, char **argv) {
 
     int result = lua_pcall(L, 0, LUA_MULTRET, 0);
     if (result) {
-        fprintf(stderr, "Failed to run script: %s\n", lua_tostring(L, -1));
+        LOG_ERROR("Failed to run script: %", lua_tostring(L, -1));
         return nullptr;
     }
 
@@ -724,14 +739,14 @@ bool load_config(int argc, char **argv, WindowProps &window_props) {
 
     int status = luaL_loadfile(L, program);
     if (status) {
-        fprintf(stderr, "Couldn't load file: %s\n", lua_tostring(L, -1));
+        LOG_ERROR("Couldn't load file: %", lua_tostring(L, -1));
         lua_close(L);
         return false;
     }
 
     int result = lua_pcall(L, 0, LUA_MULTRET, 0);
     if (result) {
-        fprintf(stderr, "Failed to run script: %s\n", lua_tostring(L, -1));
+        LOG_ERROR("Failed to run script: %", lua_tostring(L, -1));
         lua_close(L);
         return false;
     }
@@ -817,7 +832,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     load_jovial_font(&default_font);
 
     lua_State* L = init(argc, (char**) argv);
-    if (!L) return -1;
+    if (!L) {
+        LOG_ERROR("Could not open 'main.lua'");
+        return -1;
+    }
 
     game.run();
 
