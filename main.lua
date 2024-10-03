@@ -4,7 +4,11 @@ local SPEED = 100
 
 function Init() 
     PlayerTexture = load_texture "./player.png"
-    print(randf())
+    PlayerID = alloc_id()
+    Physics.create{id = PlayerID, position = v2(100), size = v2(100), type = Physics.Actor}
+
+    WallID = alloc_id()
+    Physics.create{id = WallID, position = v2(100, 250), size = v2(100), type = Physics.Solid}
 end
 push_system(EventIDs.Init, Init)
 
@@ -30,6 +34,8 @@ function Draw()
         texture = PlayerTexture,
         position = position,
     }
+
+    Physics.debug()
 end
 push_system(EventIDs.Draw, Draw)
 
@@ -37,6 +43,8 @@ function Update()
     local velocity = Input.get_direction{up = Actions.W, left = Actions.A, down = Actions.S, right = Actions.D}
     velocity = v2_mul(velocity, v2(SPEED * Time.delta()))
     position = v2_add(position, velocity)
+
+    Physics.move(PlayerID, velocity)
 
     local s = Input.string_typed()
     prompt = prompt .. s

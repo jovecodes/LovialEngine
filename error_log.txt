@@ -1,1 +1,2 @@
-Couldn't load file: main.lua:48: unexpected symbol near 'if'
+ERROR: could not call Lua callback: main.lua:8: bad argument #1 to 'create' (number expected, got table)
+

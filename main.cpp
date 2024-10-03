@@ -8,12 +8,15 @@
 #include "Util/Systems.h"
 #include "OS/FileAccess.h"
 #include "Util/JovialFont.h"
+#include "Batteries/PhysicsPP.h"
 
 using namespace jovial;
 
 #define ERROR_LOG_PATH "./error_log.txt"
 
 PixelFont default_font;
+pp::Physics physics;
+
 Arena static_arena;
 Arena frame_arena;
 
@@ -712,6 +715,136 @@ int lua_randb(lua_State *L) {
     return 1;
 }
 
+int lua_alloc_id(lua_State *L) {
+    lua_pushinteger(L, alloc_id().id);
+    return 1;
+}
+
+int lua_physics_get(lua_State *L) {
+    ID id;
+    id.id = luaL_checkinteger(L, 1);
+
+    const pp::PhysicsObject *obj = physics.objects.get(id);
+
+    lua_newtable(L);
+    if (obj == nullptr) {
+        push_v2(L, obj->aabb.position); lua_setfield(L, -2, "position");
+        push_v2(L, obj->aabb.size); lua_setfield(L, -2, "size");
+        lua_pushinteger(L, obj->layer); lua_setfield(L, -1, "layer");
+        lua_pushinteger(L, obj->mask); lua_setfield(L, -1, "mask");
+        lua_pushinteger(L, obj->type); lua_setfield(L, -1, "type");
+    }
+
+    return 1;
+}
+
+int lua_physics_move(lua_State *L) {
+    ID id;
+    id.id = luaL_checkinteger(L, 1);
+
+    lua_getfield(L, 2, "x");
+    float x = luaL_checknumber(L, -1);
+    lua_getfield(L, 2, "y");
+    float y = luaL_checknumber(L, -1);
+    lua_pop(L, 2);
+
+    lua_pushinteger(L, physics.move_actor(id, {x, y}).id);
+    return 1;
+}
+
+int lua_physics_create(lua_State *L) {
+    ID id;
+    lua_getfield(L, 1, "id");
+    id.id = luaL_checkinteger(L, -1);
+
+    Vector2 position, size;
+    load_v2(L, position, "position", 1);
+    load_v2(L, size, "size", 1);
+
+    lua_getfield(L, 1, "layer");
+    int layer = luaL_optinteger(L, -1, 1);
+
+    lua_getfield(L, 1, "mask");
+    int mask = luaL_optinteger(L, -1, 1);
+
+    lua_getfield(L, 1, "type");
+    int type = luaL_optinteger(L, -1, 0);
+
+    physics.objects.insert(id, {{position, size}, (pp::PhysicsObject::Type) type, mask, layer});
+
+    return 0;
+}
+
+int lua_physics_destroy(lua_State *L) {
+    ID id;
+    id.id = luaL_checkinteger(L, 1);
+
+    physics.objects.erase(id);
+
+    return 0;
+}
+
+int lua_physics_aabb_cast(lua_State *L) {
+    Vector2 position, size;
+    load_v2(L, position, "position", 1);
+    load_v2(L, size, "size", 1);
+
+    lua_getfield(L, 1, "mask");
+    int mask = luaL_checkinteger(L, -1);
+
+    lua_pushinteger(L, physics.aabb_cast({position, size}, mask).id);
+    return 1;
+}
+
+int lua_physics_ray_cast(lua_State *L) {
+    Vector2 start, finish;
+    load_v2(L, start, "start", 1);
+    load_v2(L, finish, "finish", 1);
+
+    lua_getfield(L, 1, "mask");
+    int mask = luaL_checkinteger(L, -1);
+
+    lua_pushinteger(L, physics.ray_cast(start, finish, mask).id);
+    return 1;
+}
+
+int lua_physics_circle_cast(lua_State *L) {
+    Vector2 center;
+    load_v2(L, center, "center", 1);
+
+    lua_getfield(L, 1, "radius");
+    float radius = luaL_checknumber(L, -1);
+
+    lua_getfield(L, 1, "mask");
+    int mask = luaL_checkinteger(L, -1);
+
+    lua_pushinteger(L, physics.circle_cast(center, radius, mask).id);
+    return 1;
+}
+
+int lua_physics_debug(lua_State *L) {
+    auto &renderer = WM::get_main_window()->get_renderers()[0];
+    physics.debug_draw(renderer);
+    return 0;
+}
+
+void bind_physics_to_lua(lua_State *L) {
+    lua_newtable(L);
+    lua_pushcfunction(L, lua_physics_get); lua_setfield(L, -2, "get");
+    lua_pushcfunction(L, lua_physics_move); lua_setfield(L, -2, "move");
+    lua_pushcfunction(L, lua_physics_create); lua_setfield(L, -2, "create");
+    lua_pushcfunction(L, lua_physics_destroy); lua_setfield(L, -2, "destroy");
+    lua_pushcfunction(L, lua_physics_aabb_cast); lua_setfield(L, -2, "aabb_cast");
+    lua_pushcfunction(L, lua_physics_ray_cast); lua_setfield(L, -2, "ray_cast");
+    lua_pushcfunction(L, lua_physics_circle_cast); lua_setfield(L, -2, "circle_cast");
+    lua_pushcfunction(L, lua_physics_debug); lua_setfield(L, -2, "debug");
+
+    lua_pushinteger(L, (int) pp::PhysicsObject::Type::Actor); lua_setfield(L, -2, "Actor");
+    lua_pushinteger(L, (int) pp::PhysicsObject::Type::Solid); lua_setfield(L, -2, "Solid");
+
+    lua_setglobal(L, "Physics");
+}
+
 void bind_input_to_lua(lua_State *L) {
     lua_newtable(L);
     lua_pushcfunction(L, lua_is_pressed); lua_setfield(L, -2, "is_pressed");
@@ -771,12 +904,14 @@ lua_State *init(int argc, char **argv) {
     bind_function(L, "randf", lua_randf);
     bind_function(L, "randb", lua_randb);
 
+    bind_function(L, "alloc_id", lua_alloc_id);
     bind_function(L, "rectangles_overlap", lua_rectangles_overlap);
 
     bind_event_ids_to_lua(L);
     bind_input_actions_to_lua(L);
     bind_input_to_lua(L);
     bind_time_to_lua(L);
+    bind_physics_to_lua(L);
 
     rng::set_seed();
 
