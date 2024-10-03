@@ -1,11 +1,12 @@
+local position = v2(1, 2)
+local prompt = "hello world"
+local SPEED = 100
+
 function Init() 
     PlayerTexture = load_texture "./player.png"
+    print(randf())
 end
 push_system(EventIDs.Init, Init)
-
-local position = v2(1, 2)
-
-local prompt = "hello world"
 
 function Draw()
     draw_rect2{
@@ -31,8 +32,6 @@ function Draw()
     }
 end
 push_system(EventIDs.Draw, Draw)
-
-local SPEED = 100
 
 function Update()
     local velocity = Input.get_direction{up = Actions.W, left = Actions.A, down = Actions.S, right = Actions.D}

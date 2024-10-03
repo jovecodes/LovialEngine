@@ -1,6 +1,7 @@
 #include "Input/Input.h"
 #include "Rendering/2D/Text.h"
 #include "Rendering/Shader.h"
+#include "Rng.h"
 #include "lua.hpp"
 #include "Jovial.h"
 #include "Window.h"
@@ -28,6 +29,12 @@ static bool has_errored = false;
         fs::append_file(ERROR_LOG_PATH, "\n");                  \
         JV_LOG_ENGINE(LOG_ERROR, __VA_ARGS__);                  \
     } while (0)
+
+#define RETURN_ERROR(L, ...)               \
+    do {                                   \
+        LOG_ERROR(__VA_ARGS__);            \
+        return luaL_error(L, __VA_ARGS__); \
+    } while(0)
 
 struct LuaSystem {
     int func_ref = 0;
@@ -61,7 +68,7 @@ void on_event(void *user_data, Event &event) {
 
 int lua_push_system(lua_State *L) {
     if (!lua_isfunction(L, 2)) {
-        luaL_error(L, "Expected an int and a function as the arguments");
+        RETURN_ERROR(L, "Expected an int and a function as the arguments");
     }
 
     // Get the first argument, which should be an int
@@ -90,7 +97,7 @@ int lua_push_system(lua_State *L) {
         vector.y = luaL_checknumber(L, -1);                                          \
         lua_pop(L, 1);                                                               \
     } else {                                                                         \
-        return luaL_error(L, "'" #vector "' must be a table {x: number, y: number}");\
+        RETURN_ERROR(L, "'" #vector "' must be a table {x: number, y: number}");\
     }                                                                                \
     lua_pop(L, 1);                                                                   \
     } while(0)
@@ -99,35 +106,34 @@ int lua_push_system(lua_State *L) {
     load_v2(L, rect.position, "position", arg); \
     load_v2(L, rect.size, "size", arg);
 
-void color_from_object(Color &result, lua_State *L) {
-    if (lua_isnil(L, -1)) {
-        return;
-    } else if (lua_istable(L, -1)) {
-        lua_getfield(L, -1, "r");  
-        result.r = luaL_optnumber(L, -1, 0.0);  
-        lua_pop(L, 1);  
-
-        lua_getfield(L, -1, "g");  
-        result.g = luaL_optnumber(L, -1, 0.0);  
-        lua_pop(L, 1);  
-
-        lua_getfield(L, -1, "b");  
-        result.b = luaL_optnumber(L, -1, 0.0);  
-        lua_pop(L, 1);  
-
-        lua_getfield(L, -1, "a");  
-        result.a = luaL_optnumber(L, -1, 1.0);  
-        lua_pop(L, 1);  
-
-        lua_pop(L, 1);  
-    } else {
-        luaL_error(L, "'color' must be an object: {r: 0, g: 0, b: 0, a: 0}");
-    }
-}
+#define color_from_object(result, L)                                            \
+    if (lua_isnil(L, -1)) {                                                     \
+        /* pass */                                                              \
+    } else if (lua_istable(L, -1)) {                                            \
+        lua_getfield(L, -1, "r");                                               \
+        result.r = luaL_optnumber(L, -1, 0.0);                                  \
+        lua_pop(L, 1);                                                          \
+                                                                                \
+        lua_getfield(L, -1, "g");                                               \
+        result.g = luaL_optnumber(L, -1, 0.0);                                  \
+        lua_pop(L, 1);                                                          \
+                                                                                \
+        lua_getfield(L, -1, "b");                                               \
+        result.b = luaL_optnumber(L, -1, 0.0);                                  \
+        lua_pop(L, 1);                                                          \
+                                                                                \
+        lua_getfield(L, -1, "a");                                               \
+        result.a = luaL_optnumber(L, -1, 1.0);                                  \
+        lua_pop(L, 1);                                                          \
+                                                                                \
+        lua_pop(L, 1);                                                          \
+    } else {                                                                    \
+        RETURN_ERROR(L, "'color' must be an object: {r: 0, g: 0, b: 0, a: 0}"); \
+    } 
 
 int lua_load_texture(lua_State *L) {
     if (!lua_isstring(L, 1)) {
-        return luaL_error(L, "Expected a string (path to the texture) as the first argument");
+        RETURN_ERROR(L, "Expected a string (path to the texture) as the first argument");
     }
 
     u64 size = 0;
@@ -151,7 +157,7 @@ int lua_load_shader(lua_State *L) {
         const char *pointer = luaL_checklstring(L, 1, &size);
         vertex = {pointer, size};
     } else {
-        return luaL_error(L, "Expected a string (path to the vertex shader) as the first argument");
+        RETURN_ERROR(L, "Expected a string (path to the vertex shader) as the first argument");
     }
 
     if (lua_isnil(L, 1)) {
@@ -161,7 +167,7 @@ int lua_load_shader(lua_State *L) {
         const char *pointer = luaL_checklstring(L, 1, &size);
         fragment = {pointer, size};
     } else {
-        return luaL_error(L, "Expected a string (path to the fragment shader) as the second argument");
+        RETURN_ERROR(L, "Expected a string (path to the fragment shader) as the second argument");
     }
 
     Shader shader = Shader::from_path(vertex, fragment);
@@ -176,7 +182,7 @@ int lua_load_shader(lua_State *L) {
 
 int lua_draw_line(lua_State *L) {
     if (!lua_istable(L, 1)) {
-        return luaL_error(L, "Expected a table {start = v2(), end = v2(), color = {}, thickness = 1.0, z_index = 0} as the first argument");
+        RETURN_ERROR(L, "Expected a table {start = v2(), end = v2(), color = {}, thickness = 1.0, z_index = 0} as the first argument");
     }
 
     Line2DCmd cmd;
@@ -201,7 +207,7 @@ int lua_draw_line(lua_State *L) {
 
 int lua_draw_text(lua_State *L) {
     if (!lua_istable(L, 1)) {
-        return luaL_error(L, "Expected a table {text = 'Hello, World', position = v2(), color = {}, z_index = 0} as the first argument");
+        RETURN_ERROR(L, "Expected a table {text = 'Hello, World', position = v2(), color = {}, z_index = 0} as the first argument");
     }
 
     Text2DCmd cmd;
@@ -228,7 +234,7 @@ int lua_draw_text(lua_State *L) {
 
 int lua_draw_rect2(lua_State *L) {
     if (!lua_istable(L, 1)) {
-        return luaL_error(L, "Expected a table {position = v2(), size = v2(), color = {}, z_index = 0} as the first argument");
+        RETURN_ERROR(L, "Expected a table {position = v2(), size = v2(), color = {}, z_index = 0} as the first argument");
     }
 
     Rect2DCmd cmd;
@@ -250,7 +256,7 @@ int lua_draw_rect2(lua_State *L) {
 
 int lua_draw_sprite(lua_State *L) {
     if (!lua_istable(L, 1)) {
-        return luaL_error(L, "Expected a table {position = {x = 0, y = 0}, texture = 0, color = {}, scale = {x = 1, y = 1}, rotation = 0, z_index = 0} as the first argument");
+        RETURN_ERROR(L, "Expected a table {position = {x = 0, y = 0}, texture = 0, color = {}, scale = {x = 1, y = 1}, rotation = 0, z_index = 0} as the first argument");
     }
 
     Sprite2DCmd cmd;
@@ -594,7 +600,7 @@ int lua_get_axis(lua_State *L) {
 
 int lua_get_direction(lua_State *L) {
     if (!lua_istable(L, 1)) {
-        return luaL_error(L, "{up: Actions.W, left: Actions.A, down: Actions.S, right: Actions.D} as the first argument");
+        RETURN_ERROR(L, "{up: Actions.W, left: Actions.A, down: Actions.S, right: Actions.D} as the first argument");
     }
 
     lua_getfield(L, 1, "left");
@@ -658,6 +664,54 @@ int lua_delta(lua_State *L) {
     return 1;
 }
 
+int lua_randi_between(lua_State *L) {
+    int low = luaL_checkinteger(L, 1);
+    int high = luaL_checkinteger(L, 2);
+
+    lua_pushinteger(L, rng::between(low, high));
+    return 1;
+}
+
+int lua_randf_between(lua_State *L) {
+    float low = luaL_checknumber(L, 1);
+    float high = luaL_checknumber(L, 2);
+
+    lua_pushnumber(L, rng::between(low, high));
+    return 1;
+}
+
+int lua_randv2_between(lua_State *L) {
+    lua_getfield(L, 1, "x");
+    float x1 = luaL_checknumber(L, -1);
+    lua_getfield(L, 1, "y");
+    float y1 = luaL_checknumber(L, -1);
+    lua_pop(L, 2);
+
+    lua_getfield(L, 2, "x");
+    float x2 = luaL_checknumber(L, -1);
+    lua_getfield(L, 2, "y");
+    float y2 = luaL_checknumber(L, -1);
+    lua_pop(L, 2);
+
+    push_v2(L, Vector2(rng::between(x1, x2), rng::between(y1, y2)));
+    return 1;
+}
+
+int lua_randf(lua_State *L) {
+    lua_pushnumber(L, rng::randf());
+    return 1;
+}
+
+int lua_randi(lua_State *L) {
+    lua_pushinteger(L, rng::randi());
+    return 1;
+}
+
+int lua_randb(lua_State *L) {
+    lua_pushboolean(L, rng::randb());
+    return 1;
+}
+
 void bind_input_to_lua(lua_State *L) {
     lua_newtable(L);
     lua_pushcfunction(L, lua_is_pressed); lua_setfield(L, -2, "is_pressed");
@@ -709,12 +763,22 @@ lua_State *init(int argc, char **argv) {
     bind_function(L, "v2_length", lua_v2_length);
     bind_function(L, "v2_angle", lua_v2_angle);
 
+    bind_function(L, "randi_between", lua_randi_between);
+    bind_function(L, "randf_between", lua_randf_between);
+    bind_function(L, "randv2_between", lua_randv2_between);
+
+    bind_function(L, "randi", lua_randi);
+    bind_function(L, "randf", lua_randf);
+    bind_function(L, "randb", lua_randb);
+
     bind_function(L, "rectangles_overlap", lua_rectangles_overlap);
 
     bind_event_ids_to_lua(L);
     bind_input_actions_to_lua(L);
     bind_input_to_lua(L);
     bind_time_to_lua(L);
+
+    rng::set_seed();
 
     int result = lua_pcall(L, 0, LUA_MULTRET, 0);
     if (result) {
