@@ -9,6 +9,9 @@ function Init()
 
     WallID = alloc_id()
     Physics.create{id = WallID, position = v2(100, 250), size = v2(100), type = Physics.Solid}
+
+    local vec = randv2_between(v2(0, 0), v2(640, 360))
+    print(vec.x, vec.y)
 end
 push_system(EventIDs.Init, Init)
 

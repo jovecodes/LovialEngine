@@ -232,12 +232,11 @@ int lua_draw_text(lua_State *L) {
 
     cmd.draw(WM::get_main_window()->get_renderers()[0], z_index);
     return 0;
-
 }
 
 int lua_draw_rect2(lua_State *L) {
     if (!lua_istable(L, 1)) {
-        RETURN_ERROR(L, "Expected a table {position = v2(), size = v2(), color = {}, z_index = 0} as the first argument");
+        RETURN_ERROR(L, "Expected a table {position = v2(), size = v2(), outline = 0, outline_color = {}, color = {}, z_index = 0} as the first argument");
     }
 
     Rect2DCmd cmd;
@@ -248,6 +247,13 @@ int lua_draw_rect2(lua_State *L) {
 
     lua_getfield(L, 1, "color");
     color_from_object(cmd.color, L);
+
+    lua_getfield(L, 1, "outline_color");
+    color_from_object(cmd.outline_color, L);
+
+    lua_getfield(L, 1, "outline");  
+    cmd.outline = luaL_optnumber(L, -1, 0.0);  
+    lua_pop(L, 1);  
 
     lua_getfield(L, 1, "z_index");  
     int z_index = luaL_optnumber(L, -1, 0.0);  
@@ -586,11 +592,25 @@ int lua_v2_angle(lua_State *L) {
     return 1;
 }
 
-int lua_rectangles_overlap(lua_State *L) {
+int lua_rect2s_overlap(lua_State *L) {
     Rect2 a, b;
     load_rect2(L, a, 1);
-    load_rect2(L, b, 1);
+    load_rect2(L, b, 2);
     lua_pushboolean(L, a.intersects(b));
+    return 1;
+}
+
+int lua_rect2_has_point(lua_State *L) {
+    Rect2 rect;
+    load_rect2(L, rect, 1);
+
+    lua_getfield(L, 2, "x");
+    float x = luaL_checknumber(L, -1);
+    lua_getfield(L, 2, "y");
+    float y = luaL_checknumber(L, -1);
+    lua_pop(L, 2);
+
+    lua_pushboolean(L, rect.has_point({x, y}));
     return 1;
 }
 
@@ -905,7 +925,8 @@ lua_State *init(int argc, char **argv) {
     bind_function(L, "randb", lua_randb);
 
     bind_function(L, "alloc_id", lua_alloc_id);
-    bind_function(L, "rectangles_overlap", lua_rectangles_overlap);
+    bind_function(L, "rect2s_overlap", lua_rect2s_overlap);
+    bind_function(L, "rect2_has_point", lua_rect2_has_point);
 
     bind_event_ids_to_lua(L);
     bind_input_actions_to_lua(L);
