@@ -1,5 +1,0 @@
-*.o
-*.a
-main
-.cache/
-.vs/
