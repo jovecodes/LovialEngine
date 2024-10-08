@@ -59,7 +59,7 @@ struct Buffer {
     void (*on_selected)(Buffer &);
 
     inline int x() {
-        return math::min(position.x, lines[position.y].size() - 1);
+        return math::MIN(position.x, lines[position.y].size() - 1);
     }
 
     inline String &line() {
@@ -179,7 +179,10 @@ struct Buffer {
             if (error != OK) return;
 
             lines.push(halloc, String(halloc, ".."));
+            printf("here\n");
             for (u32 i = 0; i < files.size(); ++i) {
+                printf("Hello, World\n");
+                println("file: %", files[i]);
                 if (files[i] == "." || files[i] == "..") continue;
 
                 StringBuilder sb;
@@ -187,6 +190,9 @@ struct Buffer {
                 if (fs::is_directory(files[i].view().tcstr())) sb.append("/");
                 
                 lines.push(halloc, sb.build(halloc));
+            }
+            if (lines.is_empty()) {
+                lines.push(halloc, String());
             }
             // lines.sort_custom<AlphabeticalSort>();
             return;
@@ -338,7 +344,7 @@ struct Global {
         path_to_game_arena.reset();
         String dir(talloc, ".");
         auto files = fs::read_dir(".", nullptr);
-        for (auto i: files) {
+        for (const auto &i: files) {
             if (i == "LovialEngine.exe" || i == "main" || i == "LovialEngine") {
                 StringBuilder sb;
 #ifdef _WIN32
@@ -686,3 +692,10 @@ int main() {
 
     game.run();
 }
+
+#ifdef _WIN32
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    printf("starting application\n");
+    main();
+}
+#endif
