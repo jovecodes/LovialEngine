@@ -1,0 +1,4 @@
+Hello. This is my own editor that I created. I wrote it using my own game engine and 
+
+
+code for the actual editor is written in c++.

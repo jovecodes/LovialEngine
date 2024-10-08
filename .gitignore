@@ -4,3 +4,4 @@ main
 .cache/
 .vs/
 x64/
+./editor/editor
