@@ -122,6 +122,11 @@ struct Buffer {
         math::CLAMP(position.x, 0, (int) line().size());
     }
 
+    void create_line(u64 at) {
+        if (flags & READ_ONLY) return;
+        lines.insert(halloc, at, String());
+    }
+
     Vector2i insert_at(Vector2i at, char c) {
         if (flags & READ_ONLY) {
             return at;                
@@ -163,8 +168,12 @@ struct Buffer {
     }
 
     inline void remove_line(int line) {
+        if (flags & READ_ONLY) return;
         lines[line].free();
         lines.remove_at(line);
+        if (lines.is_empty()) {
+            lines.push(halloc, String());
+        }
     }
 
     void load(StrView path) {
@@ -179,10 +188,7 @@ struct Buffer {
             if (error != OK) return;
 
             lines.push(halloc, String(halloc, ".."));
-            printf("here\n");
             for (u32 i = 0; i < files.size(); ++i) {
-                printf("Hello, World\n");
-                println("file: %", files[i]);
                 if (files[i] == "." || files[i] == "..") continue;
 
                 StringBuilder sb;
@@ -235,6 +241,7 @@ struct Global {
     FreeFont font;
     ui::Theme theme;
     OwnedDArray<Buffer> buffers;
+
     int buffer_index = -1;
     int last_buffer_index = -1;
 
@@ -296,23 +303,26 @@ struct Global {
             font.unload();
             font = {};
         }
+#define SDF_AA 0.6
+#define BITMAP_AA 0.8
+
 #ifdef BUNDLE_FONT
         if (sdf) {
             font.load_buffer(FONT_DATA, FONT_DATA_LEN, size, FreeFont::SDF);
-            freetype_set_anti_aliasing_factor(0.6);
+            freetype_set_anti_aliasing_factor(SDF_AA);
         } else {
             font.load_buffer(FONT_DATA, FONT_DATA_LEN, size, FreeFont::BITMAP);
-            freetype_set_anti_aliasing_factor(0.8);
+            freetype_set_anti_aliasing_factor(BITMAP_AA);
         }
 #else
         const char *path = "./editor/jet_brains.ttf";
         JV_ASSERT(fs::file_exists(path, nullptr));
         if (sdf) {
             font.load(path, size, FreeFont::SDF);
-            freetype_set_anti_aliasing_factor(0.6);
+            freetype_set_anti_aliasing_factor(SDF_AA);
         } else {
             font.load(path, size, FreeFont::BITMAP);
-            freetype_set_anti_aliasing_factor(0.8);
+            freetype_set_anti_aliasing_factor(BITMAP_AA);
         }
 #endif
     }
@@ -396,6 +406,12 @@ inline bool is_shift_pressed() {
     X(VimMode::Normal, "j", buf->move_y(1)) \
     X(VimMode::Normal, "k", buf->move_y(-1)) \
     X(VimMode::Normal, "l", buf->move_x(1)) \
+    X(VimMode::Normal, "gg", buf->position = Vector2i(0, 0); buf->move_y(0)) \
+    X(VimMode::Normal, "G", buf->move_y(buf->lines.size())) \
+    X(VimMode::Normal, "o", buf->create_line(buf->position.y + 1); buf->move_y(1); g.vim_mode = VimMode::Insert) \
+    X(VimMode::Normal, "a", buf->move_x(1); g.vim_mode = VimMode::Insert) \
+    X(VimMode::Normal, "A", buf->move_x(buf->line().size()); g.vim_mode = VimMode::Insert) \
+    X(VimMode::Normal, "dd", buf->remove_line(buf->position.y))
 
 void on_typed(Global &g, Events::KeyTyped &event) {
     Buffer *buf = g.current_buffer();
@@ -426,12 +442,25 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
     Buffer *buf = g.current_buffer();
     if (!buf) return;
 
-    if (event.keycode == Actions::Backspace) {
-        buf->position = buf->remove_at({buf->position.x - 1, buf->position.y});
-    } else if (event.keycode == Actions::Delete) {
-        buf->remove_at(buf->position);
-    } else if (event.keycode == Actions::Enter) {
-        if (buf->flags & Buffer::DIRECTORY) {
+    // Handle text editing actions
+    if ((g.vim_mode == VimMode::Insert || g.bindings == MOUSE_BINDINGS)) {
+        switch (event.keycode) {
+            case Actions::Backspace:
+                buf->position = buf->remove_at({buf->position.x - 1, buf->position.y});
+                break;
+            case Actions::Delete:
+                buf->remove_at(buf->position);
+                break;
+            case Actions::Enter:
+                buf->position = buf->insert_at(buf->position, '\n');
+                return;
+            default: break;
+        }
+    }
+
+    // Handle directory-related actions
+    if (buf->flags & Buffer::DIRECTORY) {
+        if (event.keycode == Actions::Enter) {
 #ifdef _WIN32
             g.open_file(tprint("%\\%", buf->file, buf->line()));
 #else
@@ -439,12 +468,7 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
 #endif
             g.close_last_buffer();
             return;
-        } else {
-            buf->position = buf->insert_at(buf->position, '\n');
         }
-    } 
-
-    if (buf->flags & Buffer::DIRECTORY) {
         if (event.keycode == Actions::Minus) {
 #ifdef _WIN32
             g.open_file(tprint("%\\..", buf->file));
@@ -455,59 +479,79 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
         }
     }
 
-    if (is_control_pressed() && event.keycode == Actions::S) {
-        buf->save();
-    } else if (is_control_pressed() && event.keycode == Actions::Space) {
-        g.play();
-    } 
-
-    if (g.bindings == VIM_BINDINGS) {
-        if (g.vim_mode == VimMode::Insert) {
-            if (event.keycode == Actions::Escape) {
-                g.vim_mode = VimMode::Normal;
-                buf->move_x(-1);
-            } 
-        }
-    }
-
-    if (event.keycode == Actions::Right) {
-        buf->move_x(1);
-    } else if (event.keycode == Actions::Left) {
-        buf->move_x(-1);
-    } else if (event.keycode == Actions::Up) {
-        buf->move_y(-1);
-    } else if (event.keycode == Actions::Down) {
-        buf->move_y(1);
-    }
-
-    if (event.keycode == Actions::F2) {
-        if (g.bindings == VIM_BINDINGS) {
-            g.bindings = MOUSE_BINDINGS;
-        } else if (g.bindings == MOUSE_BINDINGS) {
-            g.bindings = VIM_BINDINGS;
-        }
-    } if (event.keycode == Actions::F1) {
-        g.load_font(g.font.size, !g.using_sdf);
-    } else if (is_control_pressed() && event.keycode == Actions::Equal) {
-        g.load_font(g.font.size + 2);
-    } else if (is_control_pressed() && event.keycode == Actions::Minus) {
-        g.load_font(g.font.size - 2);
-    } else if (is_control_pressed() && event.keycode == Actions::Num0) {
-        g.load_font();
-    }
-
-    if (is_control_pressed() && event.keycode == Actions::O) {
-        if (is_shift_pressed()) {
-            g.open_file(buf->file.get_base_dir());
+    // Handle prompt-related actions
+    if (!buf->prompt.is_empty()) {
+        if (event.keycode == Actions::Escape) {
+            g.close_current_buffer();
+            g.vim_mode = VimMode::Normal;
             return;
-// #ifdef _WIN32
-//             g.open_file(tprint("%\\.", buf->file));
-// #else
-//             g.open_file(tprint("%/.", buf->file));
-// #endif
-        } else {
-            g.open_prompt("Path: ", on_open_file);
         }
+    }
+
+    // Handle control key actions
+    if (is_control_pressed()) {
+        switch (event.keycode) {
+            case Actions::S:
+                buf->save();
+                break;
+            case Actions::Space:
+                g.play();
+                break;
+            case Actions::Equal:
+                g.load_font(g.font.size + 2);
+                break;
+            case Actions::Minus:
+                g.load_font(g.font.size - 2);
+                break;
+            case Actions::Num0:
+                g.load_font();
+                break;
+            case Actions::O:
+                if (is_shift_pressed()) {
+                    g.open_file(buf->file.get_base_dir());
+                } else {
+                    g.open_prompt("Path: ", on_open_file);
+                }
+                return;
+            case Actions::Num6: 
+                g.set_buffer(g.last_buffer_index);
+                return;
+            default: break;
+        }
+    }
+
+    // Handle Vim-specific actions
+    if (g.bindings == VIM_BINDINGS && g.vim_mode == VimMode::Insert && event.keycode == Actions::Escape) {
+        g.vim_mode = VimMode::Normal;
+        buf->move_x(-1);
+    }
+
+    // Handle arrow keys for movement
+    switch (event.keycode) {
+        case Actions::Right:
+            buf->move_x(1);
+            break;
+        case Actions::Left:
+            buf->move_x(-1);
+            break;
+        case Actions::Up:
+            buf->move_y(-1);
+            break;
+        case Actions::Down:
+            buf->move_y(1);
+            break;
+        default: break;
+    }
+
+    // Handle function keys
+    switch (event.keycode) {
+        case Actions::F1:
+            g.load_font(g.font.size, !g.using_sdf);
+            break;
+        case Actions::F2:
+            g.bindings = (g.bindings == VIM_BINDINGS) ? MOUSE_BINDINGS : VIM_BINDINGS;
+            break;
+        default: break;
     }
 }
 
@@ -695,7 +739,6 @@ int main() {
 
 #ifdef _WIN32
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    printf("starting application\n");
     main();
 }
 #endif
