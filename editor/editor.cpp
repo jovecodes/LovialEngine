@@ -17,13 +17,15 @@
 #include "Rendering/Viewport.h"
 #include "Window.h"
 #include "OS/Command.h"
+#include "Util/EasingFuncs.h"
 
 using namespace jovial;
 
 #define SDF_AA 0.6
 #define BITMAP_AA 0.8
 #define TAB_WIDTH 4
-#define MAX_HISTORY 20
+#define MAX_HISTORY 50
+#define ERROR_DURATION 2.0
 
 enum VimMode {
     VimNormal = 1 << 0,
@@ -55,11 +57,21 @@ struct AlphabeticalSort {
 struct Edit {
     Vector2i position;
     String text;
+    String deleted_text;
+
+    void maybe_free() {
+        if (!text.is_empty()) text.free();
+        if (!deleted_text.is_empty()) deleted_text.free();
+    }
 };
+
+void set_error_str(String string);
+#define set_error(...) set_error_str(sprint(halloc, __VA_ARGS__))
 
 struct Buffer {
     DArray<String> lines;
     String file;
+    String search;
 
     Vector2i selection_start = Vector2i(-1, -1);
     bool select_lines = false;
@@ -70,8 +82,10 @@ struct Buffer {
     Vector2i copied_flash_start;
     StopWatch copied_flash{};
 
-    // Edit history[MAX_HISTORY];
-    // int current_history = 0;
+    Edit history[MAX_HISTORY];
+    int current_history = 0;
+    int undo_level = 0;
+    bool broken_edit = true;
 
     enum Flags {
         READ_ONLY = 1 << 0,
@@ -102,9 +116,19 @@ struct Buffer {
 
     void paste() {
         const char *contents = clipboard::get(WM::get_main_window_id());
-        for (; *contents; ++contents) {
-            position = insert_at(position, *contents);
+
+        if (StrView(contents).find('\n') != -1) {
+            position.x = line().size(); 
+            insert('\n');
+
+            Vector2i pos = position;
+            for (; *contents; ++contents) insert(*contents);
+            position = pos;
+        } else {
+            for (; *contents; ++contents) insert(*contents);
         }
+
+        broken_edit = true;
     }
 
     void copy() {
@@ -143,6 +167,127 @@ struct Buffer {
 
         return res;
     }
+
+    Vector2i perform(Edit &edit) {
+        Vector2i pos = edit.position;
+        for (auto c: edit.text) {
+            if (c == '\b') {
+                edit.deleted_text.push(halloc, char_at({pos.x - 1, pos.y}));
+                pos = remove_at({pos.x - 1, pos.y});
+            } else if (c == 127) {
+                edit.deleted_text.push(halloc, char_at(pos));
+                pos = remove_at(pos);
+            } else {
+                pos = insert_at(pos, c);
+            }
+        }
+        return pos;
+    }
+
+    Vector2i undo_edit(Edit edit) {
+        Vector2i position = edit.position;
+        int delete_index = edit.deleted_text.size() - 1;
+        for (int i = 0; i < edit.text.size(); ++i) {
+            if (edit.text[i] == '\b') {
+                position = insert_at(position, edit.deleted_text[delete_index--]);
+            } else if (edit.text[i] == 127) {
+                position = insert_at({position.x + 1, position.y}, edit.deleted_text[delete_index++]);
+            } else {
+                if (edit.text[i] == '\n') {
+                    position.y += 1;
+                    position.x = -1;
+                }
+                position = remove_at(position);
+            }
+        }
+        return position;
+    }
+
+    void undo() {
+        if (undo_level >= MAX_HISTORY - 1) {
+            set_error("already at oldest change (max history is 50)");
+            return;
+        }
+
+        current_history -= 1;
+        if (current_history < 0) current_history = MAX_HISTORY - 1;
+
+        if (history[current_history].text.is_empty()) {
+            current_history = (current_history + 1) % MAX_HISTORY;
+            set_error("already at oldest change (max history is 50)");
+            return;
+        }
+
+        undo_level += 1;
+        position = undo_edit(history[current_history]);
+    }
+
+    void redo() {
+        if (undo_level <= 0) {
+            set_error("already at newest change");
+            return;
+        }
+        if (history[current_history].text.is_empty()) return;
+
+        undo_level -= 1;
+        position = perform(history[current_history]);
+        current_history = (current_history + 1) % MAX_HISTORY;
+    }
+
+    Vector2i edit(Edit edit) {
+        Vector2i res = perform(edit);
+        history[current_history].maybe_free();
+        history[current_history] = edit;
+        current_history = (current_history + 1) % MAX_HISTORY;
+        return res;
+    }
+
+    void insert(char c) {
+        if (broken_edit) {
+            position = edit({position, String(halloc, c)});
+        } else {
+            int last = current_history - 1;
+            if (last < 0) last = MAX_HISTORY - 1;
+            history[last].text.push(halloc, c);
+            position = insert_at(position, c);
+        }
+        broken_edit = false;
+    }
+
+    char char_at(Vector2i at) {
+        if (at.x == -1 || at.x > lines[at.y].size()) return '\n';
+        return lines[at.y][math::CLAMPED(at.x, 0, lines[at.y].size() - 1)];
+    }
+
+    void backspace() {
+        if (broken_edit) {
+            position = edit({position, String(halloc, '\b')});
+        } else {
+            int last = current_history - 1;
+            if (last < 0) last = MAX_HISTORY - 1;
+            if (history[last].text.size() >= 1 && history[last].text.back() != '\b') {
+                history[last].text.pop();
+            } else {
+                history[last].deleted_text.push(halloc, char_at({position.x - 1, position.y}));
+                history[last].text.push(halloc, '\b');
+            }
+            position = remove_at({position.x - 1, position.y});
+        }
+        broken_edit = false;
+    }
+
+    // void del() {
+    //     char ch = 127;
+    //     if (broken_edit) {
+    //         position = edit({position, String(halloc, ch)});
+    //         broken_edit = false;
+    //     } else {
+    //         int last = current_history - 1;
+    //         if (last < 0) last = MAX_HISTORY - 1;
+    //         history[last].text.push(halloc, ch);
+    //         position = remove_at(position);
+    //     }
+    // }
 
     Vector2i remove_at(Vector2i at) {
         Vector2i old_position = position;
@@ -196,33 +341,30 @@ struct Buffer {
     static bool is_pos_between(Vector2i pos, Vector2i a, Vector2i b) {
         if (a == Vector2i(-1, -1) || b == Vector2i(-1, -1)) return false;
 
-        // Determine which position is the start and which is the end
         Vector2i sel_start = is_pos_less_or_equal(a, b) ? a : b;
         Vector2i sel_end = is_pos_less_or_equal(a, b) ? b : a;
 
-        // Check if 'at' is within the selection range
         return is_pos_less_or_equal(sel_start, pos) && is_pos_less_or_equal(pos, sel_end);
     }
 
     bool is_selected(Vector2i at) {
         Vector2i start = selection_start, end = position;
 
-        // Ensure start and end are correctly ordered
         if (is_pos_less_or_equal(position, selection_start)) {
             start = position;
             end = selection_start;
         }
 
         if (select_lines) {
-            // Adjust start and end for full-line selection
             start.x = 0;
-            end.x = lines[end.y].size();  // Include the entire line
+            end.x = lines[end.y].size();
         }
 
         return is_pos_between(at, start, end);
     }
 
     void move_y(int amount) {
+        broken_edit = true;
         position.y += amount;
 
         // TODO: make these numbers based on window height
@@ -238,6 +380,7 @@ struct Buffer {
     }
 
     void move_x(int amount) {
+        broken_edit = true;
         position.x += amount;
         math::CLAMP(position.y, 0, (int) lines.size() - 1);
         math::CLAMP(position.x, 0, (int) line().size());
@@ -369,8 +512,12 @@ struct Buffer {
         for (auto &line: lines) {
             line.free();
         }
+        for (int i = 0; i < MAX_HISTORY; ++i) {
+            history[i].maybe_free();
+        }
         lines.free();
         file.free();
+        search.free();
     }
 };
 
@@ -389,8 +536,8 @@ struct Global {
 
     float line_spacing = 1.2f;
 
-    StrView path_to_game;
-    Arena path_to_game_arena;
+    StrView compile_command;
+    Arena compile_command_arena;
     os::Proc game_proc;
 
     Bindings bindings = VIM_BINDINGS;
@@ -398,7 +545,11 @@ struct Global {
     Arena command_arena;
     String command;
 
-    StrView error = "";
+    struct Error {
+        StopWatch timer{};
+        String text;
+    };
+    DArray<Error> errors;
     bool using_sdf = false;
 
     void flush_command() {
@@ -483,26 +634,26 @@ struct Global {
         theme.text_padding = 10.0f;
     }
 
-    void play() {
+    void compile() {
         if (game_proc.is_valid()) game_proc.wait();
         os::Command command;
-        command.append(path_to_game);
+        command.append(compile_command);
         game_proc = command.run_async();
     }
 
     void find_game() {
-        path_to_game_arena.reset();
+        compile_command_arena.reset();
         String dir(talloc, ".");
         auto files = fs::read_dir(".", nullptr);
         for (const auto &i: files) {
-            if (i == "LovialEngine.exe" || i == "main" || i == "LovialEngine") {
+            if (i == "LovialEngine.exe" || i == "LovialEngine" || i == "build.jov.sh" | i == "build.jov.bat") {
                 StringBuilder sb;
 #ifdef _WIN32
                 sb.append(dir, "\\", i);
 #else 
                 sb.append(dir, "/", i);
 #endif
-                path_to_game = sb.build(path_to_game_arena);
+                compile_command = sb.build(compile_command_arena);
             }
         }
     }
@@ -529,8 +680,15 @@ struct Global {
             buffer.free();
         }
         font.unload();
+
+        for (auto e: errors) e.text.free();
+        errors.free();
     }
 } global;
+
+void set_error_str(String string) {
+    global.errors.push(halloc, {StopWatch(ERROR_DURATION), string});
+}
 
 inline bool is_control_pressed() {
     return Input::is_pressed(Actions::LeftControl) || Input::is_pressed(Actions::RightControl);
@@ -554,17 +712,20 @@ const VimMotion VIM_MOTIONS[] = {
     {VimNormal | VimVisual | VimVisualLine, "l", [](Buffer &buf) { buf.move_x(1); }},
     {VimNormal | VimVisual | VimVisualLine, "gg", [](Buffer &buf) { buf.position = Vector2i(0, 0); buf.move_y(0); }},
     {VimNormal | VimVisual | VimVisualLine, "G", [](Buffer &buf) { buf.move_y(buf.lines.size()); }},
-    {VimNormal | VimVisual | VimVisualLine, "o", [](Buffer &buf) { buf.create_line(buf.position.y + 1); buf.move_y(1); global.vim_mode = VimInsert; }},
-    {VimNormal | VimVisual | VimVisualLine, "O", [](Buffer &buf) { buf.create_line(buf.position.y); global.vim_mode = VimInsert; }},
+    {VimNormal | VimVisual | VimVisualLine, "o", [](Buffer &buf) { buf.position.x = buf.line().size(); buf.insert('\n'); global.vim_mode = VimInsert; }},
+    {VimNormal | VimVisual | VimVisualLine, "O", [](Buffer &buf) { buf.move_y(1); buf.position.x = buf.line().size(); buf.insert('\n'); global.vim_mode = VimInsert; }},
     {VimNormal | VimVisual | VimVisualLine, "a", [](Buffer &buf) { buf.move_x(1); global.vim_mode = VimInsert; }},
     {VimNormal | VimVisual | VimVisualLine, "A", [](Buffer &buf) { buf.move_x(buf.line().size()); global.vim_mode = VimInsert; }},
     {VimNormal | VimVisual | VimVisualLine, "0", [](Buffer &buf) { buf.position.x = 0; }},
     {VimNormal | VimVisual | VimVisualLine, "$", [](Buffer &buf) { buf.position.x = buf.line().size() - 1; }},
+    {VimNormal | VimVisual | VimVisualLine, "p", [](Buffer &buf) { buf.paste(); }},
     {VimNormal, "dd", [](Buffer &buf) { buf.remove_line(buf.position.y); }},
     {VimNormal, " v", [](Buffer &buf) { global.open_file(buf.file.get_base_dir()); }},
+    {VimNormal, " r", [](Buffer &buf) { global.compile(); }},
     {VimNormal, "v", [](Buffer &buf) { buf.selection_start = buf.position; global.vim_mode = VimVisual; }},
     {VimNormal, "V", [](Buffer &buf) { buf.selection_start = buf.position; global.vim_mode = VimVisualLine; }},
-    {VimVisual | VimVisualLine, "y", [](Buffer &buf) { buf.copy(); buf.selection_start = Vector2i(-1, -1); global.vim_mode = VimNormal; }},
+    {VimNormal, "u", [](Buffer &buf) { buf.undo(); }},
+    {VimVisual | VimVisualLine, "y", [](Buffer &buf) { buf.copy(); global.vim_mode = VimNormal; }},
     {VimVisual | VimVisualLine, "d", [](Buffer &buf) { buf.remove_at(buf.position); global.vim_mode = VimNormal; }},
 };
 
@@ -576,7 +737,8 @@ void on_typed(Global &g, Events::KeyTyped &event) {
         Vector2i delete_position(-1, -1);
 
         if (g.vim_mode == VimInsert) {
-            buf->position = buf->insert_at(buf->position, event.character);
+            buf->insert(event.character);
+            // buf->position = buf->insert_at(buf->position, event.character);
         } else {
             g.command.push(g.command_arena, event.character);
 
@@ -626,12 +788,21 @@ void on_open_file(Buffer &buffer) {
     global.close_last_buffer();
 }
 
+void set_compile_command(Buffer &buffer) {
+    global.compile_command_arena.reset();
+    global.compile_command = String(global.compile_command_arena, buffer.line());
+    global.close_current_buffer();
+}
+
 void on_pressed(Global &g, Events::KeyPressed &event) {
     Buffer *buf = g.current_buffer();
     if (!buf) return;
 
     if (g.bindings == VIM_BINDINGS) {
         buf->select_lines = g.vim_mode == VimVisualLine;
+        if (!(g.vim_mode & (VimVisual | VimVisualLine))) {
+            buf->selection_start = Vector2i(-1, -1);
+        }
     }
 
     // Handle text editing actions
@@ -645,18 +816,18 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
                     }
                     if (tab) {
                         for (int i = 0; i < TAB_WIDTH - 1; ++i) {
-                            buf->position = buf->remove_at({buf->position.x - 1, buf->position.y});
+                            buf->backspace();
                         }
                     }
                 }
                 
-                buf->position = buf->remove_at({buf->position.x - 1, buf->position.y});
+                buf->backspace();
              } break;
-            case Actions::Delete:
-                buf->remove_at(buf->position);
-                break;
+            // case Actions::Delete:
+            //     buf->del();
+            //     break;
             case Actions::Enter:
-                buf->position = buf->insert_at(buf->position, '\n');
+                buf->insert('\n');
                 return;
             case Actions::Tab:
                 for (int i = 0; i < TAB_WIDTH; ++i) {
@@ -697,11 +868,23 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
         }
     }
 
+    if (is_control_pressed() && is_shift_pressed() && event.keycode == Actions::C) {
+        g.open_prompt("Compile Command: ", set_compile_command);
+        return;
+    }
+
     // Handle control key actions
     if (is_control_pressed()) {
         switch (event.keycode) {
             case Actions::S:
                 buf->save();
+                break;
+            case Actions::Z:
+                buf->undo();
+                break;
+            case Actions::R:
+            case Actions::Y:
+                buf->redo();
                 break;
             case Actions::C:
                 buf->copy();
@@ -710,7 +893,7 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
                 buf->paste();
                 break;
             case Actions::Space:
-                g.play();
+                g.compile();
                 break;
             case Actions::Equal:
                 g.load_font(g.font.size + 2);
@@ -720,6 +903,12 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
                 break;
             case Actions::Num0:
                 g.load_font();
+                break;
+            case Actions::U:
+                buf->move_y(-20);
+                break;
+            case Actions::D:
+                buf->move_y(20);
                 break;
             case Actions::K: {
                 StrView extension = buf->file.get_extension();
@@ -829,8 +1018,10 @@ void update_mouse(Global &g, Events::Update &event) {
         }
     }
 
-    buf->cam_offset += Input::get_scroll() * 2;
-    buf->move_y(0);
+    if (Input::get_scroll() != 0) {
+        buf->cam_offset += Input::get_scroll() * 2;
+        buf->move_y(0);
+    }
 }
 
 void draw(Global &g, Events::Draw &e) {
@@ -843,24 +1034,13 @@ void draw(Global &g, Events::Draw &e) {
     ui::Layout layout(talloc, {{0, 0}, WM::get_main_window()->get_size()});
     const float line_percent = 1 - (g.font.size * g.line_spacing * 2) / WM::get_main_window()->get_height();
 
-    { // top status line
-        Rect2 rect = layout.push_percent(ui::TOP, line_percent, 1 - line_percent);
-        Renderer2D::from(e.renderers[0])->set_scissor(rect);
-
-        if (!g.error.is_empty()) {
-            ui::label(e.renderers[0], g.font, rect, g.error, *g.theme.named_colors.get("theme_red"), ui::RIGHT);
-        }
-
-        layout.pop();
-    }
-
     { // bottom status line
         Rect2 rect = layout.push_percent(ui::BOTTOM, line_percent, 1 - line_percent);
         Renderer2D::from(e.renderers[0])->set_scissor(rect);
 
         StrView msg = tprint("%:%:%", buf->file, buf->position.y + 1, buf->position.x + 1);
         ui::label(e.renderers[0], g.font, rect, msg, g.theme.primary, ui::RIGHT);
-        ui::label(e.renderers[0], g.font, rect, g.path_to_game.is_empty() ? "unfound" : g.path_to_game, g.theme.muted, ui::CENTER);
+        ui::label(e.renderers[0], g.font, rect, g.compile_command.is_empty() ? "no compile command" : g.compile_command, g.theme.muted, ui::CENTER);
         
         if (g.bindings == VIM_BINDINGS) {
             ui::label(e.renderers[0], g.font, rect, tprint("Vim: % %", vim_mode_to_string(g.vim_mode), g.command), g.theme.muted, ui::LEFT);
@@ -965,11 +1145,49 @@ void draw(Global &g, Events::Draw &e) {
         }
     }
 
+    const float pad = 10;
+
+    { // top status line
+        Rect2 rect = layout.push_percent(ui::TOP, line_percent, 1 - line_percent);
+        rect.position.y -= pad;
+        rect.position.x += pad;
+        Renderer2D::from(e.renderers[0])->set_scissor(rect);
+
+        for (int i = g.errors.size() - 1; i >= 0; --i) {
+            auto &it = g.errors[i];
+            if (it.timer.tick_down()) {
+                it.text.free();
+                g.errors.remove_at(i);
+                continue;
+            }
+
+            Vector2 size(pad * 2, g.font.size * g.line_spacing + pad);
+            g.font.measure(size, it.text);
+
+            Vector2 position = rect.top_right() - size;
+
+            const float animation_len = 0.5;
+            if (it.timer.time < animation_len) {
+                float t = 1 - it.timer.time * 1.0f/animation_len;
+                position.x = math::lerp(position.x, (float) WM::get_main_window()->get_width(), (float) easers::in(t));
+            }
+
+            rect = {position, size};
+
+            Renderer2D::from(e.renderers[0])->set_scissor(rect);
+            ClearScreen2DCmd{g.theme.muted}.immediate_draw(e.renderers[0]);
+            ui::label(e.renderers[0], g.font, rect, it.text, *g.theme.named_colors.get("theme_red"), ui::CENTER);
+
+            rect.position.y -= rect.size.y + pad;
+        }
+
+        layout.pop();
+    }
+
      // prompt
     if (!g.buffers[g.buffer_index].prompt.is_empty()) {
         buf = &g.buffers[g.buffer_index];
 
-        const float pad = 10;
         Vector2 size(pad * 2, g.font.size * g.line_spacing + pad);
         g.font.measure(size, buf->prompt);
         g.font.measure(size, buf->line());
@@ -987,7 +1205,7 @@ void draw(Global &g, Events::Draw &e) {
     }
 }
 
-int main() {
+int main(int argc, char* argv[]) {
     Jovial game;
 
     WindowProps props{
@@ -1006,7 +1224,10 @@ int main() {
     global.load_font();
     global.load_default_theme();
     global.find_game();
-    global.open_file(".");
+
+    // Use the first argument if provided, otherwise use "."
+    const char* file_to_open = (argc > 1) ? argv[1] : ".";
+    global.open_file(file_to_open);
 
     WindowManager::get_main_window()->get_viewport()->push_system(global, draw);
     game.push_system(global, on_typed);
@@ -1018,6 +1239,6 @@ int main() {
 
 #ifdef _WIN32
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    main();
+    return main(__argc, __argv);
 }
 #endif
