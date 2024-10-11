@@ -26,6 +26,7 @@ using namespace jovial;
 #define TAB_WIDTH 4
 #define MAX_HISTORY 50
 #define ERROR_DURATION 2.0
+#define SCROLL_OFF 7
 
 #define STRINGIFY(s) #s
 
@@ -57,6 +58,7 @@ struct AlphabeticalSort {
 };
 
 struct Edit {
+    Vector2i start_position;
     Vector2i position;
     String text;
     String deleted_text;
@@ -67,8 +69,8 @@ struct Edit {
     }
 };
 
-void set_error_str(String string);
-#define set_error(...) set_error_str(sprint(halloc, __VA_ARGS__))
+void push_error_str(String string);
+#define push_error(...) push_error_str(auto_sprintf(__VA_ARGS__))
 
 struct Buffer {
     DArray<String> lines;
@@ -99,7 +101,7 @@ struct Buffer {
     void (*on_selected)(Buffer &);
 
     inline int x() {
-        return math::MIN(position.x, lines[position.y].size() - 1);
+        return math::min(position.x, (int) line().size());
     }
 
     inline String &line() {
@@ -119,7 +121,7 @@ struct Buffer {
     void paste() {
         const char *contents = clipboard::get(WM::get_main_window_id());
 
-        if (StrView(contents).find('\n') != -1) {
+        if (StrView(contents).find_char('\n') != -1) {
             position.x = line().size(); 
             insert('\n');
 
@@ -153,7 +155,7 @@ struct Buffer {
 
         while (is_pos_less_or_equal(start, end)) {
             if (lines[start.y].is_empty()) {
-                res.append(alloc, '\n');
+                res.push(alloc, '\n');
                 start.y += 1;
                 start.x = 0;
                 continue;
@@ -161,7 +163,7 @@ struct Buffer {
             res.push(alloc, lines[start.y][start.x]);
             start.x += 1;
             if (start.x >= lines[start.y].size()) {
-                res.append(alloc, '\n');
+                res.push(alloc, '\n');
                 start.y += 1;
                 start.x = 0;
             }
@@ -170,91 +172,85 @@ struct Buffer {
         return res;
     }
 
-    Vector2i perform(Edit &edit) {
-        Vector2i pos = edit.position;
+    void perform(Edit &edit) {
+        position = edit.start_position;
+
         for (auto c: edit.text) {
             if (c == '\b') {
-                edit.deleted_text.push(halloc, char_at({pos.x - 1, pos.y}));
-                pos = remove_at({pos.x - 1, pos.y});
+                edit.deleted_text.push(halloc, char_at({x() - 1, position.y}));
+                position = remove_at({x() - 1, position.y});
             } else if (c == 127) {
-                edit.deleted_text.push(halloc, char_at(pos));
-                pos = remove_at(pos);
+                edit.deleted_text.push(halloc, char_at(position));
+                position = remove_at(position);
             } else {
-                set_error("%", c);
-                pos = insert_at(pos, c);
+                insert_char(c);
             }
         }
-        return pos;
     }
 
-    Vector2i undo_edit(Edit edit) {
-        Vector2i position = edit.position;
+    void undo_edit(Edit edit) {
+        position = edit.position;
         int delete_index = edit.deleted_text.size() - 1;
         for (int i = 0; i < edit.text.size(); ++i) {
             if (edit.text[i] == '\b') {
-                position = insert_at(position, edit.deleted_text[delete_index--]);
+                insert_char(edit.deleted_text[delete_index--]);
             } else if (edit.text[i] == 127) {
-                position = insert_at({position.x + 1, position.y}, edit.deleted_text[delete_index++]);
+                move_x(1);
+                insert_char(edit.deleted_text[delete_index++]);
             } else {
                 if (edit.text[i] == '\n') {
-                    position.y += 1;
-                    position.x = -1;
+                    move_y(1);
+                    move_x(-1);
                 }
-                position = remove_at(position);
+                if (x() == 0) position.x = -1;
+                position = remove_at({x(), position.y});
             }
         }
-        return position;
     }
 
     void undo() {
-        if (undo_level >= MAX_HISTORY - 1) {
-            set_error("already at oldest change (max history is 50)");
-            return;
-        }
-
         current_history -= 1;
         if (current_history < 0) current_history = MAX_HISTORY - 1;
 
-        if (history[current_history].text.is_empty()) {
+        if (undo_level >= MAX_HISTORY - 1 || history[current_history].text.is_empty()) {
             current_history = (current_history + 1) % MAX_HISTORY;
-            set_error("already at oldest change (max history is 50)");
+            push_error("already at oldest change (max history is %d)", MAX_HISTORY);
             return;
         }
 
         undo_level += 1;
-        position = undo_edit(history[current_history]);
+        undo_edit(history[current_history]);
     }
 
     void redo() {
-        if (undo_level <= 0) {
-            set_error("already at newest change");
+        if (undo_level <= 0 || history[current_history].text.is_empty()) {
+            push_error("already at newest change");
             return;
         }
-        if (history[current_history].text.is_empty()) return;
 
         undo_level -= 1;
-        position = perform(history[current_history]);
+        perform(history[current_history]);
         current_history = (current_history + 1) % MAX_HISTORY;
     }
 
-    Vector2i edit(Edit edit) {
-        Vector2i res = perform(edit);
+    void edit(Edit edit) {
+        perform(edit);
+        edit.position = position;
         history[current_history].maybe_free();
         history[current_history] = edit;
         current_history = (current_history + 1) % MAX_HISTORY;
-        return res;
     }
 
     void insert(char c) {
         if (broken_edit) {
             String s;
             s.push(halloc, c);
-            position = edit({position, s});
+            edit({{x(), position.y}, {x(), position.y}, s});
         } else {
             int last = current_history - 1;
             if (last < 0) last = MAX_HISTORY - 1;
             history[last].text.push(halloc, c);
-            position = insert_at(position, c);
+            insert_char(c);
         }
         broken_edit = false;
     }
@@ -264,19 +260,25 @@ struct Buffer {
         return lines[at.y][math::CLAMPED(at.x, 0, lines[at.y].size() - 1)];
     }
 
+    void select_line() {
+        selection_start = position;
+        select_lines = true;
+    }
+
     void backspace() {
         if (broken_edit) {
-            position = edit({position, String(halloc, "\b")});
+            edit({{x() - 1, position.y}, {x(), position.y}, String(halloc, "\b")});
         } else {
             int last = current_history - 1;
             if (last < 0) last = MAX_HISTORY - 1;
             if (history[last].text.size() >= 1 && history[last].text.back() != '\b') {
                 history[last].text.pop();
             } else {
-                history[last].deleted_text.push(halloc, char_at({position.x - 1, position.y}));
+                history[last].deleted_text.push(halloc, char_at({x() - 1, position.y}));
                 history[last].text.push(halloc, '\b');
             }
-            position = remove_at({position.x - 1, position.y});
+            position = remove_at({x() - 1, position.y});
+            // history[last].position = position;
         }
         broken_edit = false;
     }
@@ -316,7 +318,7 @@ struct Buffer {
             return start;
         }
 
-        if (position.x < 0) {
+        if (x() < 0 || line().size() == 0) {
             if (position.y > 0) {
                 move_y(-1);
                 position.x = line().size();
@@ -324,7 +326,7 @@ struct Buffer {
 
                 remove_line(position.y + 1);
             }
-        } else if (position.x >= line().size()) {
+        } else if (x() >= line().size()) {
             line().pop();
         } else {
             line().remove_at(position.x);
@@ -372,21 +374,21 @@ struct Buffer {
         broken_edit = true;
         position.y += amount;
 
-        // TODO: make these numbers based on window height
-        if (position.y - cam_offset > 20) {
-            cam_offset += amount;
-        }
-        if (position.y - cam_offset < 5) {
-            cam_offset -= math::abs(amount);
-        }
-        cam_offset = math::CLAMPED(cam_offset, 0, (int) lines.size() - 1);
+        // // TODO: make these numbers based on window height
+        // if (position.y - cam_offset > 20) {
+        //     cam_offset += amount;
+        // }
+        // if (position.y - cam_offset < 5) {
+        //     cam_offset -= math::abs(amount);
+        // }
+        // cam_offset = math::CLAMPED(cam_offset, 0, (int) lines.size() - 1);
 
         math::CLAMP(position.y, 0, (int) lines.size() - 1);
     }
 
     void move_x(int amount) {
         broken_edit = true;
-        position.x += amount;
+        position.x = x() + amount;
         math::CLAMP(position.y, 0, (int) lines.size() - 1);
         math::CLAMP(position.x, 0, (int) line().size());
     }
@@ -396,19 +398,16 @@ struct Buffer {
         lines.insert(halloc, at, String());
     }
 
-    Vector2i append_at(Vector2i at, StrView text) {
+    void append(StrView text) {
         for (auto c: text) {
-            at = insert_at(at, c);
+            insert(c);
         }
-        return at;
     }
 
-    Vector2i insert_at(Vector2i at, char c) {
+    void insert_char(char c) {
         if (flags & READ_ONLY) {
-            return at;                
+            return;
         }
-        Vector2i old_position = position;
-        position = at;
 
         if (selection_start != Vector2i(-1, -1)) {
             position = remove_at(position);
@@ -416,17 +415,15 @@ struct Buffer {
 
         if (!prompt.is_empty() && c == '\n') {
             on_selected(*this);
-            position = old_position;
-            return at;
+            return;
         }
 
-        if (c == '\n' && at.x >= line().size()) {
+        if (c == '\n' && x() >= line().size()) {
             lines.insert(halloc, position.y + 1, String());
 
             position.x = 0;
             move_y(1);
         } else if (c == '\n') {
-            position = at;
             lines.insert(halloc, position.y + 1, String());
             StrView str = line().substr(x());
             lines[position.y + 1].copy_from(halloc, str.ptr(), str.size());
@@ -436,17 +433,13 @@ struct Buffer {
 
             position.x = 0;
             move_y(1);
-        } else if (at.x >= line().size()) {
+        } else if (position.x >= line().size()) {
             line().push(halloc, c);
-            position.x += 1;
+            move_x(1);
         } else {
             line().insert(halloc, x(), c);
-            position.x += 1;
+            move_x(1);
         }
-
-        Vector2i result = position;
-        position = old_position;
-        return result;
     }
 
     inline void remove_line(int line) {
@@ -462,7 +455,7 @@ struct Buffer {
         Vector2i old_selection = selection_start;
         selection_start = start;
         position = end;
-        remove_at(end);
+        backspace();
         selection_start = old_selection;
     }
 
@@ -691,7 +684,7 @@ struct Global {
     }
 } global;
 
-void set_error_str(String string) {
+void push_error_str(String string) {
     global.errors.push(halloc, {StopWatch(ERROR_DURATION), string});
 }
 
@@ -724,14 +717,14 @@ const VimMotion VIM_MOTIONS[] = {
     {VimNormal | VimVisual | VimVisualLine, "0", [](Buffer &buf) { buf.position.x = 0; }},
     {VimNormal | VimVisual | VimVisualLine, "$", [](Buffer &buf) { buf.position.x = buf.line().size() - 1; }},
     {VimNormal | VimVisual | VimVisualLine, "p", [](Buffer &buf) { buf.paste(); }},
-    {VimNormal, "dd", [](Buffer &buf) { buf.remove_line(buf.position.y); }},
+    {VimNormal, "dd", [](Buffer &buf) { buf.select_line(); buf.backspace(); }},
     {VimNormal, " v", [](Buffer &buf) { global.open_file(buf.file.get_base_dir()); }},
     {VimNormal, " r", [](Buffer &buf) { global.compile(); }},
     {VimNormal, "v", [](Buffer &buf) { buf.selection_start = buf.position; global.vim_mode = VimVisual; }},
     {VimNormal, "V", [](Buffer &buf) { buf.selection_start = buf.position; global.vim_mode = VimVisualLine; }},
     {VimNormal, "u", [](Buffer &buf) { buf.undo(); }},
     {VimVisual | VimVisualLine, "y", [](Buffer &buf) { buf.copy(); global.vim_mode = VimNormal; }},
-    {VimVisual | VimVisualLine, "d", [](Buffer &buf) { buf.remove_at(buf.position); global.vim_mode = VimNormal; }},
+    {VimVisual | VimVisualLine, "d", [](Buffer &buf) { buf.backspace(); global.vim_mode = VimNormal; }},
 };
 
 void on_typed(Global &g, Events::KeyTyped &event) {
@@ -739,7 +732,7 @@ void on_typed(Global &g, Events::KeyTyped &event) {
     if (!buf) return;
 
     if (g.bindings == VIM_BINDINGS) {
-        Vector2i delete_position(-1, -1);
+        // Vector2i delete_position(-1, -1);
 
         if (g.vim_mode == VimInsert) {
             buf->insert(event.character);
@@ -747,10 +740,10 @@ void on_typed(Global &g, Events::KeyTyped &event) {
         } else {
             g.command.push(g.command_arena, event.character);
 
-            if (g.command.size() >= 2 && g.command[g.command.size() - 2] == 'd') {
-                delete_position = buf->position;
-                g.command.remove_at(g.command.size() - 2);
-            } 
+            // if (g.command.size() >= 2 && g.command[g.command.size() - 2] == 'd') {
+            //     delete_position = buf->position;
+            //     g.command.remove_at(g.command.size() - 2);
+            // } 
             if (g.command.size() >= 2 && g.command[g.command.size() - 2] == 'f') {
                 int pos = buf->line().find_char(g.command.back(), buf->position.x + 1);
                 if (pos != -1) {
@@ -776,15 +769,15 @@ void on_typed(Global &g, Events::KeyTyped &event) {
             }
         }
 
-        if (delete_position != Vector2i(-1, -1)) {
-            if (buf->position.y != delete_position.y) {
-                buf->select_lines = true;
-            }
-            buf->delete_selection(delete_position, buf->position);
-        }
+        // if (delete_position != Vector2i(-1, -1)) {
+        //     if (buf->position.y != delete_position.y) {
+        //         buf->select_lines = true;
+        //     }
+        //     buf->delete_selection(delete_position, buf->position);
+        // }
 
     } else {
-        buf->position = buf->insert_at(buf->position, event.character);
+        buf->insert_char(event.character);
     }
 }
 
@@ -814,10 +807,14 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
     if ((g.vim_mode == VimInsert || g.bindings == MOUSE_BINDINGS)) {
         switch (event.keycode) {
             case Actions::Backspace: {
-                if (buf->position.x >= TAB_WIDTH) {
+                int x = buf->x();
+                if (x >= buf->line().size()) x = buf->line().size() - 1;
+                if (x >= TAB_WIDTH) {
+                    println("line size: %", buf->line().size() - 1);
+                    println("x: %", x);
                     bool tab = true;
                     for (int i = 0; i < TAB_WIDTH; ++i) {
-                        if (buf->line()[buf->x() - i] != ' ') tab = false;
+                        if (buf->line()[x - i] != ' ') tab = false;
                     }
                     if (tab) {
                         for (int i = 0; i < TAB_WIDTH - 1; ++i) {
@@ -836,7 +833,7 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
                 return;
             case Actions::Tab:
                 for (int i = 0; i < TAB_WIDTH; ++i) {
-                    buf->position = buf->insert_at(buf->position, ' ');
+                    buf->insert_char(' ');
                 }
                 return;
             default: break;
@@ -917,26 +914,26 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
                 break;
             case Actions::K: {
                 StrView extension = buf->file.get_extension();
-#define DEFINE_COMMENT(buf, str) \
-                do { \
-                    int at = buf->line().find(str); \
-                    if (at != -1) { \
-                        for (int i = 0; i < sizeof(str) - 1; ++i) { \
-                            buf->line().remove_at(at); \
-                        } \
-                    } else { \
-                        buf->append_at({0, buf->position.y}, str); \
-                        buf->position.x += sizeof(str) - 1; \
-                    } \
-                } while (0)
-
-                if (extension == "lua") {
-                    DEFINE_COMMENT(buf, "--");
-                } else if (extension == "c" || extension == "cpp" || extension == "rs") {
-                    DEFINE_COMMENT(buf, "//");
-                } else if (extension == "py") {
-                    DEFINE_COMMENT(buf, "#");
-                }
+// #define DEFINE_COMMENT(buf, str) \
+//                 do { \
+//                     int at = buf->line().find(str); \
+//                     if (at != -1) { \
+//                         for (int i = 0; i < sizeof(str) - 1; ++i) { \
+//                             buf->line().remove_at(at); \
+//                         } \
+//                     } else { \
+//                         buf->append_at({0, buf->position.y}, str); \
+//                         buf->position.x += sizeof(str) - 1; \
+//                     } \
+//                 } while (0)
+//
+//                 if (extension == "lua") {
+//                     DEFINE_COMMENT(buf, "--");
+//                 } else if (extension == "c" || extension == "cpp" || extension == "rs") {
+//                     DEFINE_COMMENT(buf, "//");
+//                 } else if (extension == "py") {
+//                     DEFINE_COMMENT(buf, "#");
+//                 }
             } break;
             case Actions::O:
                 if (is_shift_pressed()) {
@@ -1105,6 +1102,19 @@ void draw(Global &g, Events::Draw &e) {
             } else {
                 buf->copied_flash_position = Vector2i(-1, -1);
             }
+        }
+
+        { // Camera movement
+            int cam_move = 0;
+            int visable_rows = math::floor(rect.size.y / (g.font.size * g.line_spacing));
+            int offset = buf->position.y - buf->cam_offset;
+            if (offset < SCROLL_OFF) {
+                cam_move = -(SCROLL_OFF - offset);
+            } else if (visable_rows - offset < SCROLL_OFF) {
+                cam_move = SCROLL_OFF - (visable_rows - offset);
+            }
+
+            buf->cam_offset = math::CLAMPED(buf->cam_offset + cam_move, 0, (int) buf->lines.size() - 1);
         }
 
         for (u32 i = buf->cam_offset; i < buf->lines.size(); ++i) {
