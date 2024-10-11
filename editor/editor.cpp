@@ -27,6 +27,8 @@ using namespace jovial;
 #define MAX_HISTORY 50
 #define ERROR_DURATION 2.0
 
+#define STRINGIFY(s) #s
+
 enum VimMode {
     VimNormal = 1 << 0,
     VimInsert = 1 << 1,
@@ -178,6 +180,7 @@ struct Buffer {
                 edit.deleted_text.push(halloc, char_at(pos));
                 pos = remove_at(pos);
             } else {
+                set_error("%", c);
                 pos = insert_at(pos, c);
             }
         }
@@ -244,7 +247,9 @@ struct Buffer {
 
     void insert(char c) {
         if (broken_edit) {
-            position = edit({position, String(halloc, c)});
+            String s;
+            s.push(halloc, c);
+            position = edit({position, s});
         } else {
             int last = current_history - 1;
             if (last < 0) last = MAX_HISTORY - 1;
@@ -261,7 +266,7 @@ struct Buffer {
 
     void backspace() {
         if (broken_edit) {
-            position = edit({position, String(halloc, '\b')});
+            position = edit({position, String(halloc, "\b")});
         } else {
             int last = current_history - 1;
             if (last < 0) last = MAX_HISTORY - 1;
