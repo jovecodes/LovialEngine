@@ -18,6 +18,7 @@
 #include "Window.h"
 #include "OS/Command.h"
 #include "Util/EasingFuncs.h"
+#include "IO/StringBuilder.h"
 
 using namespace jovial;
 
@@ -27,6 +28,7 @@ using namespace jovial;
 #define MAX_HISTORY 50
 #define ERROR_DURATION 2.0
 #define SCROLL_OFF 7
+#define PATH_MAX 256
 
 #define STRINGIFY(s) #s
 
@@ -63,17 +65,282 @@ struct Edit {
     String text;
     String deleted_text;
 
-    void maybe_free() {
-        if (!text.is_empty()) text.free();
-        if (!deleted_text.is_empty()) deleted_text.free();
+    void free() {
+        text.free();
+        deleted_text.free();
     }
 };
 
 void push_error_str(String string);
 #define push_error(...) push_error_str(auto_sprintf(__VA_ARGS__))
 
+String lines_to_string(Allocator alloc, const DArray<String> lines) {
+    StringBuilder sb;
+    for (const auto &line: lines) {
+        sb.append(line);
+        sb.append("\n");
+    }
+    return sb.build(alloc);
+}
+
+struct Token {
+    u64 line;
+    u64 end_line;
+    u32 start;
+    u32 end;
+
+    enum Type {
+        NORMAL,
+        KEYWORD,
+        COMMENT,
+        STRING,
+    } type;
+};
+
+static const StrView CPP_KEYWORDS[] = {
+    CSV("void"),
+    CSV("struct"),
+    CSV("enum"),
+    CSV("class"),
+    CSV("const"),
+    CSV("static"),
+    CSV("return"),
+
+    CSV("if"),
+    CSV("for"),
+    CSV("while"),
+    CSV("switch"),
+    CSV("case"),
+    CSV("goto"),
+    CSV("do"),
+
+    CSV("#define"),
+    CSV("#undef"),
+    CSV("#include"),
+    CSV("#if"),
+    CSV("#else"),
+    CSV("#endif"),
+    CSV("#ifdef"),
+    CSV("#ifndef"),
+
+    CSV("int"),
+    CSV("float"),
+    CSV("long"),
+    CSV("double"),
+    CSV("bool"),
+    CSV("char"),
+};
+
+static const StrView LUA_KEYWORDS[] = {
+    CSV("and"),
+    CSV("break"),
+    CSV("do"),
+    CSV("else"),
+    CSV("elseif"),
+    CSV("end"),
+    CSV("false"),
+    CSV("for"),
+    CSV("function"),
+    CSV("if"),
+    CSV("in"),
+    CSV("local"),
+    CSV("nil"),
+    CSV("not"),
+    CSV("or"),
+    CSV("repeat"),
+    CSV("return"),
+    CSV("then"),
+    CSV("true"),
+    CSV("until"),
+    CSV("while"),
+};
+
+struct Tokenizer {
+    std::atomic<bool> done;
+    std::thread thread;
+    bool already_done = true;
+
+    DArray<Token> tokens;
+    String file;
+
+    enum Type {
+        CPP,
+        LUA,
+    } type;
+
+    bool _handle_space(u64 &i, u64 &line, u32 &line_offset) {
+        if (isspace(file[i])) {
+            if (file[i] == '\n') {
+                line_offset = 0;
+                line++;
+            } else {
+                ++line_offset;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    bool _handle_single_line_comment(u64 &i, u64 &line, u32 &line_offset, StrView code) {
+        if (i < file.size() - (code.size() - 1) && file.substr(i, code.size()) == code) {
+            char *pointer = file.ptr() + i;
+            u32 start = line_offset;
+
+            while (i < file.size() && file[i] != '\n') {
+                i++, line_offset++;
+            }
+
+            tokens.push(halloc, {line, line, start, line_offset, Token::COMMENT});
+            --i, --line_offset;
+            return true;
+        }
+        return false;
+    }
+
+    bool _handle_multi_line_comment(u64 &i, u64 &line, u32 &line_offset, StrView begin, StrView end) {
+        if (i < file.size() - (begin.size() - 1) && file.substr(i, begin.size()) == begin) {
+            char *pointer = file.ptr() + i;
+            u32 start = line_offset;
+            u64 start_line = line;
+
+            while (i < file.size() - (end.size() - 1) && file.substr(i, end.size()) != end) {
+                if (file[i] == '\n') {
+                    line_offset = 0;
+                    line++;
+                    i++;
+                } else {
+                    line_offset++;
+                    i++;
+                }
+            }
+
+            tokens.push(halloc, {start_line, line, start, line_offset + 2, Token::COMMENT});
+            i--;
+            return true;
+        }
+        return false;
+    }
+
+    bool _handle_string(u64 &i, u64 &line, u32 &line_offset) {
+        if (file[i] == '"') {
+            char *pointer = file.ptr() + i;
+            u32 start = line_offset;
+            u64 start_line = line;
+            i += 1, line_offset += 1;
+
+            bool escape = false;
+            while (i < file.size()) {
+                if (file[i] == '\n') {
+                    line_offset = 0;
+                    line++;
+                } else {
+                    line_offset++;
+                }
+
+                // Handle escaped characters
+                if (escape) {
+                    escape = false;  // Reset escape flag after processing the escape
+                } else if (file[i] == '\\') {
+                    escape = true;   // Set escape flag when encountering backslash
+                } else if (file[i] == '"') {
+                    break;  // End of string
+                }
+
+                i++;  // Move to the next character
+            }
+            
+            tokens.push(halloc, {line, line, start, line_offset, Token::STRING});
+            return true;
+        }
+        return false;
+    }
+
+    bool _handle_keywords(u64 &i, u64 &line, u32 &line_offset, View<StrView> keywords) {
+        if (isalpha(file[i]) || file[i] == '_' || file[i] == '#') {
+            char *pointer = file.ptr() + i;
+            u32 start = line_offset;
+            i += 1, line_offset += 1;
+
+            while (i < file.size() && (isalpha(file[i]) || file[i] == '_' || file[i] == '#')) {
+                i++, line_offset++;
+            }
+
+            StrView view = StrView(pointer, line_offset - start);
+            for (int j = 0; j < keywords.size(); ++j) {
+                if (keywords[j] == view) {
+                    tokens.push(halloc, {line, line, start, line_offset, Token::KEYWORD});
+                }
+            }
+
+            --i;
+            return true;
+        }
+        return false;
+    }
+
+    void _lua_tokenize() {
+        u64 line = 0;
+        u32 line_offset = 0;
+        for (u64 i = 0; i < file.size(); ++i) {
+            if (_handle_space(i, line, line_offset)) continue;
+            if (_handle_single_line_comment(i, line, line_offset, "--")) continue;
+            if (_handle_multi_line_comment(i, line, line_offset, "--[[", "]]--")) continue;
+            if (_handle_string(i, line, line_offset)) continue;
+            if (_handle_keywords(i, line, line_offset, LUA_KEYWORDS)) continue;
+            ++line_offset;
+        }
+    }
+
+    void _cpp_tokenize() {
+        u64 line = 0;
+        u32 line_offset = 0;
+        for (u64 i = 0; i < file.size(); ++i) {
+            if (_handle_space(i, line, line_offset)) continue;
+            if (_handle_single_line_comment(i, line, line_offset, "//")) continue;
+            if (_handle_multi_line_comment(i, line, line_offset, "/*", "*/")) continue;
+            if (_handle_string(i, line, line_offset)) continue;
+            if (_handle_keywords(i, line, line_offset, CPP_KEYWORDS)) continue;
+            ++line_offset;
+        }
+    }
+
+    static void _tokenize(Tokenizer *tokenizer) {
+        switch (tokenizer->type) {
+            case CPP:
+                tokenizer->_cpp_tokenize();
+                break;
+            case LUA:
+                tokenizer->_lua_tokenize();
+                break;
+        }
+        tokenizer->done.store(true);
+    }
+
+    void tokenize(const DArray<String> &lines, StrView path) {
+        StrView extension = path.get_extension();
+        if (extension == "c" || extension == "cpp") {
+            type = CPP;
+        } else if (extension == "lua") {
+            type = LUA;
+        } else {
+            return;
+        }
+
+        tokens.free();
+        file.free();
+        file = lines_to_string(halloc, lines);
+
+        already_done = false;
+        done.store(false);
+        thread = std::thread(_tokenize, this);
+    }
+};
+
 struct Buffer {
     DArray<String> lines;
+    DArray<Token> tokens;
+    Tokenizer *tokenizer;
+
     String file;
     String search;
 
@@ -86,7 +353,7 @@ struct Buffer {
     Vector2i copied_flash_start;
     StopWatch copied_flash{};
 
-    Edit history[MAX_HISTORY];
+    Edit *history;
     int current_history = 0;
     int undo_level = 0;
     bool broken_edit = true;
@@ -94,6 +361,7 @@ struct Buffer {
     enum Flags {
         READ_ONLY = 1 << 0,
         DIRECTORY = 1 << 1,
+        NEEDS_RETOKENIZE = 1 << 2,
     };
 
     int flags = 0;
@@ -109,13 +377,7 @@ struct Buffer {
     }
 
     void save() {
-        StringBuilder sb;
-        for (const auto &line: lines) {
-            sb.append(line);
-            sb.append("\n");
-        }
-
-        fs::write_file(file, sb.build(talloc));
+        fs::write_file(file, lines_to_string(talloc, lines));
     }
 
     void paste() {
@@ -233,19 +495,25 @@ struct Buffer {
         current_history = (current_history + 1) % MAX_HISTORY;
     }
 
-    void edit(Edit edit) {
+    void edit(String s) {
+        Edit edit{{x(), position.y}, {x(), position.y}, s};
         perform(edit);
         edit.position = position;
-        history[current_history].maybe_free();
+        history[current_history].free();
         history[current_history] = edit;
         current_history = (current_history + 1) % MAX_HISTORY;
     }
 
     void insert(char c) {
+        if (!prompt.is_empty() && c == '\n') {
+            on_selected(*this);
+            return;
+        }
+
         if (broken_edit) {
             String s;
             s.push(halloc, c);
-            edit({{x(), position.y}, {x(), position.y}, s});
+            edit(s);
         } else {
             int last = current_history - 1;
             if (last < 0) last = MAX_HISTORY - 1;
@@ -265,9 +533,34 @@ struct Buffer {
         select_lines = true;
     }
 
-    void backspace() {
-        if (broken_edit) {
-            edit({{x() - 1, position.y}, {x(), position.y}, String(halloc, "\b")});
+    void _backspace() {
+        if (selection_start != Vector2i(-1, -1)) {
+            Vector2i start = is_pos_less_or_equal(selection_start, position) ? selection_start : position;
+            Vector2i end = is_pos_less_or_equal(selection_start, position) ? position : selection_start;
+
+            selection_start = Vector2i(-1, -1);
+
+            position = end;
+
+            if (select_lines) {
+                position.x = line().size();
+                start.x = 0;
+            }
+
+            move_x(1);
+            while (is_pos_less(start, position)) {
+                _backspace();
+            }
+
+            if (select_lines) {
+                if (lines.size() != 1 && position.y == 0) {
+                    position.y += 1;
+                    position.x = -1;
+                }
+                _backspace();
+            }
+        } else if (broken_edit) {
+            edit(String(halloc, "\b"));
         } else {
             int last = current_history - 1;
             if (last < 0) last = MAX_HISTORY - 1;
@@ -278,9 +571,27 @@ struct Buffer {
                 history[last].text.push(halloc, '\b');
             }
             position = remove_at({x() - 1, position.y});
+            history[last].position = position;
             // history[last].position = position;
         }
         broken_edit = false;
+    }
+
+    void backspace() {
+        int _x = x();
+        if (_x >= line().size()) _x = line().size() - 1;
+        if (_x >= TAB_WIDTH) {
+            bool tab = true;
+            for (int i = 0; i < TAB_WIDTH; ++i) {
+                if (line()[_x - i] != ' ') tab = false;
+            }
+            if (tab) {
+                for (int i = 0; i < TAB_WIDTH - 1; ++i) {
+                    _backspace();
+                }
+            }
+        }
+        _backspace();
     }
 
     // void del() {
@@ -300,23 +611,25 @@ struct Buffer {
         Vector2i old_position = position;
         position = at;
 
-        // TODO: delete entire lines where possible
-        if (selection_start != Vector2i(-1, -1)) {
-            Vector2i start = is_pos_less_or_equal(selection_start, position) ? selection_start : position;
-            Vector2i end = is_pos_less_or_equal(selection_start, position) ? position : selection_start;
+        flags |= NEEDS_RETOKENIZE;
 
-            selection_start = Vector2i(-1, -1);
-
-            while (is_pos_less_or_equal(start, end)) {
-                end = remove_at(end);
-                end.x -= 1;
-            }
-            // TODO: shouldn't this not be necessary
-            remove_at(start);
-
-            position = old_position;
-            return start;
-        }
+        // // TODO: delete entire lines where possible
+        // if (selection_start != Vector2i(-1, -1)) {
+        //     Vector2i start = is_pos_less_or_equal(selection_start, position) ? selection_start : position;
+        //     Vector2i end = is_pos_less_or_equal(selection_start, position) ? position : selection_start;
+        //
+        //     selection_start = Vector2i(-1, -1);
+        //
+        //     while (is_pos_less_or_equal(start, end)) {
+        //         end = remove_at(end);
+        //         end.x -= 1;
+        //     }
+        //     // TODO: shouldn't this not be necessary
+        //     remove_at(start);
+        //
+        //     position = old_position;
+        //     return start;
+        // }
 
         if (x() < 0 || line().size() == 0) {
             if (position.y > 0) {
@@ -342,6 +655,12 @@ struct Buffer {
     static bool is_pos_less_or_equal(Vector2i a, Vector2i b) {
         if (a.y < b.y) return true;
         if (a.y == b.y && a.x <= b.x) return true;
+        return false;
+    }
+
+    static bool is_pos_less(Vector2i a, Vector2i b) {
+        if (a.y < b.y) return true;
+        if (a.y == b.y && a.x < b.x) return true;
         return false;
     }
 
@@ -409,13 +728,10 @@ struct Buffer {
             return;
         }
 
+        flags |= NEEDS_RETOKENIZE;
+
         if (selection_start != Vector2i(-1, -1)) {
             position = remove_at(position);
-        }
-
-        if (!prompt.is_empty() && c == '\n') {
-            on_selected(*this);
-            return;
         }
 
         if (c == '\n' && x() >= line().size()) {
@@ -460,15 +776,26 @@ struct Buffer {
     }
 
     void load(StrView path) {
+        history = halloc.array<Edit>(MAX_HISTORY);
         file = String(halloc, path);
         Arena content_arena;
 
         Error error = OK;
 
-        if (fs::is_directory(path.tcstr())) {
+        char *path_cstring = path.tcstr();
+        if (fs::is_directory(path_cstring)) {
             flags |= READ_ONLY | DIRECTORY;
             DArray<String> files = fs::read_dir(path, &error);
             if (error != OK) return;
+
+            {
+                char *symlinkpath = path_cstring;
+                char actualpath[PATH_MAX+1];
+                char *ptr;
+
+                ptr = realpath(symlinkpath, actualpath);
+                lines.push(halloc, String(halloc, ptr));
+            }
 
             lines.push(halloc, String(halloc, ".."));
             for (u32 i = 0; i < files.size(); ++i) {
@@ -487,8 +814,12 @@ struct Buffer {
             return;
         }
 
+        flags |= NEEDS_RETOKENIZE;
+
+        tokenizer = halloc.single<Tokenizer>();
         if (!fs::file_exists(path, &error)) {
-            fs::write_file(path, "");
+            lines.push(halloc, String());
+            return;
         }
 
         String contents = fs::read_file(content_arena, path, &error);
@@ -511,11 +842,20 @@ struct Buffer {
             line.free();
         }
         for (int i = 0; i < MAX_HISTORY; ++i) {
-            history[i].maybe_free();
+            history[i].free();
         }
         lines.free();
         file.free();
         search.free();
+        ::free(history);
+
+        if (tokenizer) {
+            if (tokenizer->thread.joinable()) tokenizer->thread.join();
+            tokenizer->file.free();
+            tokenizer->tokens.free();
+        }
+        tokens.free();
+        ::free(tokenizer);
     }
 };
 
@@ -526,7 +866,12 @@ enum Bindings {
 
 struct Global {
     FreeFont font;
+
     ui::Theme theme;
+    Color comment_color;
+    Color keyword_color;
+    Color string_color;
+
     OwnedDArray<Buffer> buffers;
 
     int buffer_index = -1;
@@ -574,6 +919,7 @@ struct Global {
         buffers.back().prompt = prompt;
         buffers.back().on_selected = callback;
         buffers.back().lines.push(halloc, String());
+        buffers.back().history = halloc.array<Edit>(MAX_HISTORY);
         
         vim_mode = VimInsert;
 
@@ -622,6 +968,7 @@ struct Global {
         theme.named_colors.insert("theme_purple", Color::hex(0xd3869bff));
         theme.named_colors.insert("theme_orange", Color::hex(0xcc7d49ff));
         theme.named_colors.insert("theme_red", Color::hex(0xe96962ff));
+
         theme.primary = Colors::GRUVBOX_WHITE.darkened(0.1);
         theme.secondary = Colors::GRUVBOX_GREY;
         theme.accent = Colors::BLACK;
@@ -630,6 +977,10 @@ struct Global {
         theme.muted = Colors::GRUVBOX_LIGHTGRAY.lightened(0.1);
         theme.outline_thickness = 3.0f;
         theme.text_padding = 10.0f;
+
+        string_color = Color::hex(0xa9b665ff);
+        keyword_color = Color::hex(0xd8a657ff);
+        comment_color = Color::hex(0x7c6f64ff); // hello
     }
 
     void compile() {
@@ -698,84 +1049,228 @@ inline bool is_shift_pressed() {
 
 struct VimMotion {
     int mode;
-    const char *match;
-    void (*action)(Buffer &buffer);
+    StrView match;
+    bool (*action)(Buffer &buffer, StrView rest);
 };
 
+StrView vim_move(StrView cmd, bool no_flush);
+
 const VimMotion VIM_MOTIONS[] = {
-    {VimNormal | VimVisual | VimVisualLine, "i", [](Buffer &buf) {global.vim_mode = VimInsert;}},
-    {VimNormal | VimVisual | VimVisualLine, "h", [](Buffer &buf) { buf.move_x(-1); }},
-    {VimNormal | VimVisual | VimVisualLine, "j", [](Buffer &buf) { buf.move_y(1); }},
-    {VimNormal | VimVisual | VimVisualLine, "k", [](Buffer &buf) { buf.move_y(-1); }},
-    {VimNormal | VimVisual | VimVisualLine, "l", [](Buffer &buf) { buf.move_x(1); }},
-    {VimNormal | VimVisual | VimVisualLine, "gg", [](Buffer &buf) { buf.position = Vector2i(0, 0); buf.move_y(0); }},
-    {VimNormal | VimVisual | VimVisualLine, "G", [](Buffer &buf) { buf.move_y(buf.lines.size()); }},
-    {VimNormal | VimVisual | VimVisualLine, "o", [](Buffer &buf) { buf.position.x = buf.line().size(); buf.insert('\n'); global.vim_mode = VimInsert; }},
-    {VimNormal | VimVisual | VimVisualLine, "O", [](Buffer &buf) { buf.move_y(1); buf.position.x = buf.line().size(); buf.insert('\n'); global.vim_mode = VimInsert; }},
-    {VimNormal | VimVisual | VimVisualLine, "a", [](Buffer &buf) { buf.move_x(1); global.vim_mode = VimInsert; }},
-    {VimNormal | VimVisual | VimVisualLine, "A", [](Buffer &buf) { buf.move_x(buf.line().size()); global.vim_mode = VimInsert; }},
-    {VimNormal | VimVisual | VimVisualLine, "0", [](Buffer &buf) { buf.position.x = 0; }},
-    {VimNormal | VimVisual | VimVisualLine, "$", [](Buffer &buf) { buf.position.x = buf.line().size() - 1; }},
-    {VimNormal | VimVisual | VimVisualLine, "p", [](Buffer &buf) { buf.paste(); }},
-    {VimNormal, "dd", [](Buffer &buf) { buf.select_line(); buf.backspace(); }},
-    {VimNormal, " v", [](Buffer &buf) { global.open_file(buf.file.get_base_dir()); }},
-    {VimNormal, " r", [](Buffer &buf) { global.compile(); }},
-    {VimNormal, "v", [](Buffer &buf) { buf.selection_start = buf.position; global.vim_mode = VimVisual; }},
-    {VimNormal, "V", [](Buffer &buf) { buf.selection_start = buf.position; global.vim_mode = VimVisualLine; }},
-    {VimNormal, "u", [](Buffer &buf) { buf.undo(); }},
-    {VimVisual | VimVisualLine, "y", [](Buffer &buf) { buf.copy(); global.vim_mode = VimNormal; }},
-    {VimVisual | VimVisualLine, "d", [](Buffer &buf) { buf.backspace(); global.vim_mode = VimNormal; }},
+    {VimNormal | VimVisual | VimVisualLine, "i", [](Buffer &buf, StrView rest) {
+		global.vim_mode = VimInsert;
+        return true;
+	}},
+
+    {VimNormal | VimVisual | VimVisualLine, "h", [](Buffer &buf, StrView rest) {
+		buf.move_x(-1); 
+        return true;
+	}},
+
+    {VimNormal | VimVisual | VimVisualLine, "j", [](Buffer &buf, StrView rest) {
+		buf.move_y(1); 
+        return true;
+	}},
+
+    {VimNormal | VimVisual | VimVisualLine, "k", [](Buffer &buf, StrView rest) {
+		buf.move_y(-1); 
+        return true;
+	}},
+
+    {VimNormal | VimVisual | VimVisualLine, "l", [](Buffer &buf, StrView rest) {
+		buf.move_x(1); 
+        return true;
+	}},
+
+    {VimNormal | VimVisual | VimVisualLine, "f", [](Buffer &buf, StrView rest) {
+        if (rest.is_empty()) return false; 
+        
+        int pos = buf.line().find_char(rest[0], buf.position.x + 1);
+        if (pos != -1) {
+            buf.position.x = pos;
+        }
+
+        return true;
+	}},
+
+    {VimNormal | VimVisual | VimVisualLine, "t", [](Buffer &buf, StrView rest) {
+        if (rest.is_empty()) return false; 
+        
+        int pos = buf.line().find_char(rest[0], buf.position.x + 1);
+        if (pos != -1) {
+            buf.position.x = pos - 1;
+        }
+
+        return true;
+	}},
+
+    {VimNormal, "d", [](Buffer &buf, StrView rest) {
+        if (rest.is_empty()) return false; 
+        
+        buf.selection_start = buf.position;
+        StrView res = vim_move(rest, false);
+
+        if (buf.position != buf.selection_start) {
+            if (buf.position.y != buf.selection_start.y) buf.select_lines = true;
+
+            buf.backspace();
+            buf.selection_start = Vector2i(-1, -1);
+
+            buf.select_lines = false;
+            return true;
+        } else {
+            return res != rest;
+        }
+	}},
+
+    {VimNormal | VimVisual | VimVisualLine, "gg", [](Buffer &buf, StrView rest) {
+		buf.position = Vector2i(0, 0); buf.move_y(0); 
+        return true;
+	}},
+
+    {VimNormal | VimVisual | VimVisualLine, "G", [](Buffer &buf, StrView rest) {
+		buf.move_y(buf.lines.size()); 
+        return true;
+	}},
+
+    {VimNormal | VimVisual | VimVisualLine, "o", [](Buffer &buf, StrView rest) {
+		buf.position.x = buf.line().size(); buf.insert('\n'); global.vim_mode = VimInsert; 
+        return true;
+	}},
+
+    {VimNormal | VimVisual | VimVisualLine, "O", [](Buffer &buf, StrView rest) {
+		buf.move_y(1); buf.position.x = buf.line().size(); buf.insert('\n'); global.vim_mode = VimInsert; 
+        return true;
+	}},
+
+    {VimNormal | VimVisual | VimVisualLine, "a", [](Buffer &buf, StrView rest) {
+		buf.move_x(1); global.vim_mode = VimInsert; 
+        return true;
+	}},
+
+    {VimNormal | VimVisual | VimVisualLine, "A", [](Buffer &buf, StrView rest) {
+		buf.move_x(buf.line().size()); global.vim_mode = VimInsert; 
+        return true;
+	}},
+
+    {VimNormal | VimVisual | VimVisualLine, "0", [](Buffer &buf, StrView rest) {
+		buf.position.x = 0; 
+        return true;
+	}},
+
+    {VimNormal | VimVisual | VimVisualLine, "$", [](Buffer &buf, StrView rest) {
+		buf.position.x = buf.line().size() - 1; 
+        return true;
+	}},
+
+    {VimNormal | VimVisual | VimVisualLine, "p", [](Buffer &buf, StrView rest) {
+		buf.paste(); 
+        return true;
+	}},
+
+    {VimNormal, "dd", [](Buffer &buf, StrView rest) {
+		buf.select_line(); buf.backspace(); 
+        return true;
+	}},
+
+    {VimNormal, " v", [](Buffer &buf, StrView rest) {
+		global.open_file(buf.file.get_base_dir()); 
+        return true;
+	}},
+
+    {VimNormal, " r", [](Buffer &buf, StrView rest) {
+		global.compile(); 
+        return true;
+	}},
+
+    {VimNormal, "v", [](Buffer &buf, StrView rest) {
+		buf.selection_start = buf.position; global.vim_mode = VimVisual; 
+        return true;
+	}},
+
+    {VimNormal, "V", [](Buffer &buf, StrView rest) {
+		buf.selection_start = buf.position; global.vim_mode = VimVisualLine; 
+        return true;
+	}},
+
+    {VimNormal, "u", [](Buffer &buf, StrView rest) {
+		buf.undo(); 
+        return true;
+	}},
+
+    {VimVisual | VimVisualLine, "y", [](Buffer &buf, StrView rest) {
+		buf.copy(); global.vim_mode = VimNormal; 
+        return true;
+	}},
+
+    {VimVisual | VimVisualLine, "d", [](Buffer &buf, StrView rest) {
+		buf.backspace(); global.vim_mode = VimNormal; 
+        return true;
+	}},
 };
+
+StrView vim_move(StrView cmd, bool no_flush = false) {
+    Buffer *buf = global.current_buffer();
+    if (!buf) return cmd;
+
+    for (int i = 0; i < cmd.size(); ++i) {
+        for (int j = 0; j < JV_ARRAY_LEN(VIM_MOTIONS); ++j) {
+            const auto &motion = VIM_MOTIONS[j];
+            StrView view = cmd.substr(i, i + motion.match.size());
+
+            if (global.vim_mode & motion.mode && view == motion.match) {
+                StrView rest = cmd.substr(i + motion.match.size());
+                bool flush = motion.action(*buf, rest);
+
+                if (flush && !no_flush) {
+                    return StrView();
+                }
+            }
+        }
+    }
+
+    return cmd;
+}
+
+
+void update_buffer(Global &g, Events::Update &event) {
+    Buffer *buf = g.current_buffer();
+    if (!buf) return;
+
+    if (buf->tokenizer) {
+        if (!buf->tokenizer->already_done && buf->tokenizer->done.load()) {
+            if (buf->tokenizer->thread.joinable()) buf->tokenizer->thread.join();
+
+            buf->tokens.free();
+            buf->tokens = buf->tokenizer->tokens;
+            buf->tokenizer->tokens = {};
+
+            buf->tokenizer->already_done = true;
+        }
+
+        if (buf->flags & Buffer::NEEDS_RETOKENIZE && buf->tokenizer->done.load()) {
+            buf->tokenizer->tokenize(buf->lines, buf->file);
+            buf->flags ^= Buffer::NEEDS_RETOKENIZE;
+        }
+    }
+}
 
 void on_typed(Global &g, Events::KeyTyped &event) {
     Buffer *buf = g.current_buffer();
     if (!buf) return;
 
     if (g.bindings == VIM_BINDINGS) {
-        // Vector2i delete_position(-1, -1);
+        g.command.push(g.command_arena, event.character);
+
+        StrView res = vim_move(g.command);
+        if (g.command != res) {
+            g.flush_command();
+            g.command.append(halloc, res);
+        }
 
         if (g.vim_mode == VimInsert) {
             buf->insert(event.character);
-            // buf->position = buf->insert_at(buf->position, event.character);
-        } else {
-            g.command.push(g.command_arena, event.character);
-
-            // if (g.command.size() >= 2 && g.command[g.command.size() - 2] == 'd') {
-            //     delete_position = buf->position;
-            //     g.command.remove_at(g.command.size() - 2);
-            // } 
-            if (g.command.size() >= 2 && g.command[g.command.size() - 2] == 'f') {
-                int pos = buf->line().find_char(g.command.back(), buf->position.x + 1);
-                if (pos != -1) {
-                    buf->position.x = pos;
-                }
-                g.command.pop();
-                g.command.pop();
-            } 
-            if (g.command.size() >= 2 && g.command[g.command.size() - 2] == 't') {
-                int pos = buf->line().find_char(g.command.back(), buf->position.x + 1);
-                if (pos != -1) {
-                    buf->position.x = pos - 1;
-                }
-                g.command.pop();
-                g.command.pop();
-            }
+            g.flush_command();
         }
-
-        for (int i = 0; i < JV_ARRAY_LEN(VIM_MOTIONS); ++i) {
-            if (g.vim_mode & VIM_MOTIONS[i].mode && g.command.view().ends_with(VIM_MOTIONS[i].match)) {
-                g.flush_command();
-                VIM_MOTIONS[i].action(*buf);
-            }
-        }
-
-        // if (delete_position != Vector2i(-1, -1)) {
-        //     if (buf->position.y != delete_position.y) {
-        //         buf->select_lines = true;
-        //     }
-        //     buf->delete_selection(delete_position, buf->position);
-        // }
-
     } else {
         buf->insert_char(event.character);
     }
@@ -803,43 +1298,6 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
         }
     }
 
-    // Handle text editing actions
-    if ((g.vim_mode == VimInsert || g.bindings == MOUSE_BINDINGS)) {
-        switch (event.keycode) {
-            case Actions::Backspace: {
-                int x = buf->x();
-                if (x >= buf->line().size()) x = buf->line().size() - 1;
-                if (x >= TAB_WIDTH) {
-                    println("line size: %", buf->line().size() - 1);
-                    println("x: %", x);
-                    bool tab = true;
-                    for (int i = 0; i < TAB_WIDTH; ++i) {
-                        if (buf->line()[x - i] != ' ') tab = false;
-                    }
-                    if (tab) {
-                        for (int i = 0; i < TAB_WIDTH - 1; ++i) {
-                            buf->backspace();
-                        }
-                    }
-                }
-                
-                buf->backspace();
-             } break;
-            // case Actions::Delete:
-            //     buf->del();
-            //     break;
-            case Actions::Enter:
-                buf->insert('\n');
-                return;
-            case Actions::Tab:
-                for (int i = 0; i < TAB_WIDTH; ++i) {
-                    buf->insert_char(' ');
-                }
-                return;
-            default: break;
-        }
-    }
-
     // Handle directory-related actions
     if (buf->flags & Buffer::DIRECTORY) {
         if (event.keycode == Actions::Enter || Input::just_double_clicked()) {
@@ -858,6 +1316,29 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
             g.open_file(tprint("%/..", buf->file));
 #endif
             return;
+        }
+    }
+
+    // Handle text editing actions
+    if ((g.vim_mode == VimInsert || g.bindings == MOUSE_BINDINGS)) {
+        switch (event.keycode) {
+            case Actions::Backspace: {
+                buf->backspace();
+             } break;
+            // case Actions::Delete:
+            //     buf->del();
+            //     break;
+            case Actions::Enter: {
+                 buf->insert('\n');
+                 return;
+            }
+            case Actions::Tab: {
+                for (int i = 0; i < TAB_WIDTH; ++i) {
+                    buf->insert_char(' ');
+                }
+                return;
+            }
+            default: break;
         }
     }
 
@@ -1026,6 +1507,33 @@ void update_mouse(Global &g, Events::Update &event) {
     }
 }
 
+Color get_color(Buffer &buf, u64 token_index, u64 i, u64 j) {
+    Color color = global.theme.primary;
+
+    if (token_index >= buf.tokens.size()) return color;
+    if (i < buf.tokens[token_index].line) return color;
+    if (i > buf.tokens[token_index].end_line) return color;
+
+    if (buf.tokens[token_index].line == i && j < buf.tokens[token_index].start) return color;
+    if (buf.tokens[token_index].end_line == i && j > buf.tokens[token_index].end) return color;
+
+    switch (buf.tokens[token_index].type) {
+        case Token::NORMAL:
+            break;
+        case Token::KEYWORD:
+            color = global.keyword_color;
+            break;
+        case Token::COMMENT:
+            color = global.comment_color;
+            break;
+        case Token::STRING:
+            color = global.string_color;
+            break;
+    }
+
+    return color;
+}
+
 void draw(Global &g, Events::Draw &e) {
     Buffer *buf = g.current_buffer();
     if (!buf) return;
@@ -1078,6 +1586,7 @@ void draw(Global &g, Events::Draw &e) {
             buf->copied_flash.tick_down();
             if (buf->selection_start != Vector2i(-1, -1) || !buf->copied_flash.is_finished()) {
                 Color selection_color = g.theme.muted;
+                selection_color.a = 0.75;
                 if (!buf->copied_flash.is_finished()) {
                     selection_color = *g.theme.named_colors.get("theme_orange");
                 }
@@ -1117,7 +1626,9 @@ void draw(Global &g, Events::Draw &e) {
             buf->cam_offset = math::CLAMPED(buf->cam_offset + cam_move, 0, (int) buf->lines.size() - 1);
         }
 
-        for (u32 i = buf->cam_offset; i < buf->lines.size(); ++i) {
+        u64 token_index = 0;
+
+        for (u64 i = buf->cam_offset; i < buf->lines.size(); ++i) {
             Vector2 line_pos(rect.position.x, pos.y);
             if (buf->position.y == i) {
                 g.font.immediate_draw(e.renderers[0], line_pos, tprint(line_number_fmt, i + 1), *g.theme.named_colors.get("theme_purple"));
@@ -1125,35 +1636,44 @@ void draw(Global &g, Events::Draw &e) {
                 g.font.immediate_draw(e.renderers[0], line_pos, tprint(line_number_fmt, math::abs((int) buf->position.y - (int) i)), g.theme.muted);
             }
 
-            if (buf->position.y == i) {
-                bool has_cursor = buf->position.x < buf->line().size();
-                
-                if (has_cursor && buf->x() != 0) {
-                    g.font.immediate_draw(e.renderers[0], pos, buf->lines[i].substr(0, buf->x()), g.theme.primary);
+            while (token_index < buf->tokens.size() && buf->tokens[token_index].end_line < i) {
+                token_index++;
+            }
+
+            for (u64 j = 0; j < buf->lines[i].size(); ++j) {
+                Color color = get_color(*buf, token_index, i, j);
+
+                // Move to the next token if we've reached the end of the current one
+                if (token_index < buf->tokens.size() && i == buf->tokens[token_index].end_line && j == buf->tokens[token_index].end - 1) {
+                    token_index++;
                 }
-                
+
+                // if (buf->is_selected({(int) i, (int) j})){
+                //
+                // } 
+
+                if (i == buf->position.y && j == buf->x()) {
+                    Rect2DCmd cmd{pos, {g.font.metrics[0].advance.x, g.font.size * g.line_spacing}, g.theme.primary};
+                    cmd.position.y -= g.font.size * (g.line_spacing - 1);
+                    cmd.color = color;
+
+                    cmd.immediate_draw(e.renderers[0]);
+                    g.font.immediate_draw(e.renderers[0], pos, buf->lines[i].substr(j, 1), g.theme.secondary);
+                } else {
+                    g.font.immediate_draw(e.renderers[0], pos, buf->lines[i].substr(j, 1), color);
+                }
+            }
+
+            if (buf->position.y == i && buf->x() >= buf->lines[i].size()) {
                 Rect2DCmd cmd{pos, {g.font.metrics[0].advance.x, g.font.size * g.line_spacing}, g.theme.primary};
                 cmd.position.y -= g.font.size * (g.line_spacing - 1);
 
-                if (has_cursor) {
-                    cmd.immediate_draw(e.renderers[0]);
-
-                    StrView single = buf->lines[i].substr(buf->x(), 1);
-                    g.font.immediate_draw(e.renderers[0], pos, single, g.theme.secondary);
-                    
-                    g.font.immediate_draw(e.renderers[0], pos, buf->lines[i].substr(buf->x() + 1), g.theme.primary);
-                } else {
-                    g.font.immediate_draw(e.renderers[0], pos, buf->lines[i], g.theme.primary);
-
-                    cmd.position.x = pos.x;
-                    cmd.immediate_draw(e.renderers[0]);
-                }
-            } else {
-                g.font.immediate_draw(e.renderers[0], pos, buf->lines[i], g.theme.primary);
+                cmd.immediate_draw(e.renderers[0]);
             }
 
             pos.x = x;
             pos.y -= g.font.size * g.line_spacing;
+
             if (pos.y < -global.font.size) {
                 break;
             }
@@ -1245,6 +1765,7 @@ int main(int argc, char* argv[]) {
     global.open_file(file_to_open);
 
     WindowManager::get_main_window()->get_viewport()->push_system(global, draw);
+    game.push_system(global, update_buffer);
     game.push_system(global, on_typed);
     game.push_system(global, on_pressed);
     game.push_system(global, update_mouse);
