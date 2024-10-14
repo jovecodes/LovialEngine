@@ -94,6 +94,7 @@ struct Token {
         KEYWORD,
         COMMENT,
         STRING,
+        PUNCT,
         NUMBER,
     } type;
 };
@@ -126,7 +127,9 @@ static const StrView CPP_KEYWORDS[] = {
     CSV("static"),
     CSV("inline"),
     CSV("extern"),
+    CSV("constexpr"),
 
+    CSV("auto"),
     CSV("void"),
     CSV("int"),
     CSV("float"),
@@ -330,6 +333,25 @@ struct Tokenizer {
         return false;
     }
 
+    bool _handle_punct(u64 &i, u64 &line, u32 &line_offset) {
+        if (ispunct(file[i]) && file[i] != '"') {
+            char *pointer = file.ptr() + i;
+            u32 start = line_offset;
+            i += 1, line_offset += 1;
+
+            while (i < file.size() && ispunct(file[i]) && file[i] != '"') {
+                i++, line_offset++;
+            }
+
+            tokens.push(halloc, {line, line, start, line_offset, Token::PUNCT});
+
+            --i;
+            return true;
+        }
+        return false;
+    }
+
+
     void _lua_tokenize() {
         u64 line = 0;
         u32 line_offset = 0;
@@ -340,6 +362,7 @@ struct Tokenizer {
             if (_handle_string(i, line, line_offset)) continue;
             if (_handle_numbers(i, line, line_offset, "")) continue;
             if (_handle_keywords(i, line, line_offset, LUA_KEYWORDS)) continue;
+            if (_handle_punct(i, line, line_offset)) continue;
             ++line_offset;
         }
     }
@@ -354,6 +377,7 @@ struct Tokenizer {
             if (_handle_string(i, line, line_offset)) continue;
             if (_handle_numbers(i, line, line_offset, "fe")) continue;
             if (_handle_keywords(i, line, line_offset, CPP_KEYWORDS)) continue;
+            if (_handle_punct(i, line, line_offset)) continue;
             ++line_offset;
         }
     }
@@ -407,15 +431,16 @@ struct Buffer {
     Vector2i copied_flash_start;
     StopWatch copied_flash{};
 
-    Edit *history;
-    int current_history = 0;
+    DArray<Edit> history;
     int undo_level = 0;
+
     bool broken_edit = true;
 
     enum Flags {
-        READ_ONLY = 1 << 0,
-        DIRECTORY = 1 << 1,
+        READ_ONLY        = 1 << 0,
+        DIRECTORY        = 1 << 1,
         NEEDS_RETOKENIZE = 1 << 2,
+        MODIFIED         = 1 << 3,
     };
 
     int flags = 0;
@@ -432,6 +457,7 @@ struct Buffer {
 
     void save() {
         fs::write_file(file, lines_to_string(talloc, lines));
+        flags &= ~MODIFIED;
     }
 
     void paste() {
@@ -470,13 +496,9 @@ struct Buffer {
             static const StrView OPENS[] = {
                 CSV("function"),
                 CSV("if"),
-                CSV("{"),
-                CSV("("),
             };
             static const StrView CLOSES[] = {
                 CSV("end"),
-                CSV("}"),
-                CSV(")"),
             };
             opens = OPENS;
             closes = CLOSES;
@@ -569,8 +591,14 @@ struct Buffer {
 
     void undo_edit(Edit edit) {
         if (flags & READ_ONLY) return;
+
         position = edit.position;
+        if (!edit.text.is_empty() && edit.text[0] != '\b') {
+            position.x -= 1;
+        }
+
         int delete_index = edit.deleted_text.size() - 1;
+
         for (int i = 0; i < edit.text.size(); ++i) {
             if (edit.text[i] == '\b') {
                 insert_char(edit.deleted_text[delete_index--]);
@@ -578,10 +606,6 @@ struct Buffer {
                 insert_char(edit.deleted_text[delete_index--]);
                 move_x(-1);
             } else {
-                if (edit.text[i] == '\n') {
-                    move_y(1);
-                    move_x(-1);
-                }
                 if (x() == 0) position.x = -1;
                 position = remove_at({x(), position.y});
             }
@@ -590,38 +614,38 @@ struct Buffer {
 
     void undo() {
         if (flags & READ_ONLY) return;
-        current_history -= 1;
-        if (current_history < 0) current_history = MAX_HISTORY - 1;
-
-        if (undo_level >= MAX_HISTORY - 1 || history[current_history].text.is_empty()) {
-            current_history = (current_history + 1) % MAX_HISTORY;
-            push_error("already at oldest change (max history is %d)", MAX_HISTORY);
+        if (undo_level >= history.size()) {
+            push_error("already at oldest change");
             return;
         }
 
         undo_level += 1;
-        undo_edit(history[current_history]);
+        undo_edit(history[history.size() - undo_level]);
     }
 
     void redo() {
         if (flags & READ_ONLY) return;
-        if (undo_level <= 0 || history[current_history].text.is_empty()) {
+        if (undo_level <= 0) {
             push_error("already at newest change");
             return;
         }
 
         undo_level -= 1;
-        perform(history[current_history]);
-        current_history = (current_history + 1) % MAX_HISTORY;
+        perform(history[history.size() - 1 - undo_level]);
     }
 
     void edit(String s) {
         Edit edit{{x(), position.y}, {x(), position.y}, s};
         perform(edit);
         edit.position = position;
-        history[current_history].free();
-        history[current_history] = edit;
-        current_history = (current_history + 1) % MAX_HISTORY;
+
+        for (int i = 0; i < undo_level; ++i) {
+            history.back().free();
+            history.pop();
+        }
+        undo_level = 0;
+
+        history.push(halloc, edit);
     }
 
     void insert(char c, int extra_indent = 0) {
@@ -636,10 +660,9 @@ struct Buffer {
             s.push(halloc, c);
             edit(s);
         } else {
-            int last = current_history - 1;
-            if (last < 0) last = MAX_HISTORY - 1;
-            history[last].text.push(halloc, c);
+            history.back().text.push(halloc, c);
             insert_char(c);
+            history.back().position = position;
         }
 
         if (c == '\n') {
@@ -658,12 +681,16 @@ struct Buffer {
         if (c == '{' && x() >= line().size()) {
             insert(c);
             Vector2i pos = position;
+            broken_edit = true;
             insert('}');
+            broken_edit = true;
             position = pos;
         } else if (c == '\n' && x() > 0 && x() < line().size() && line()[x()] == '}') {
             insert(c);
             Vector2i pos = position;
+            broken_edit = true;
             insert(c, -1);
+            broken_edit = true;
             position = pos;
         } else {
             insert(c);
@@ -710,17 +737,14 @@ struct Buffer {
         } else if (broken_edit) {
             edit(String(halloc, "\b"));
         } else {
-            int last = current_history - 1;
-            if (last < 0) last = MAX_HISTORY - 1;
-            if (history[last].text.size() >= 1 && history[last].text.back() != '\b' && history[last].text.back() != 127) {
-                history[last].text.pop();
+            if (history.back().text.size() >= 1 && history.back().text.back() != '\b' && history.back().text.back() != 127) {
+                history.back().text.pop();
             } else {
-                history[last].deleted_text.push(halloc, char_at({x() - 1, position.y}));
-                history[last].text.push(halloc, '\b');
+                history.back().deleted_text.push(halloc, char_at({x() - 1, position.y}));
+                history.back().text.push(halloc, '\b');
             }
             position = remove_at({x() - 1, position.y});
-            history[last].position = position;
-            // history[last].position = position;
+            history.back().position = position;
         }
         broken_edit = false;
     }
@@ -750,20 +774,20 @@ struct Buffer {
             return;
         }
 
-        if (selection_start != Vector2i(-1, -1)) {
-            backspace();
-        } else if (broken_edit) {
-            edit(String(halloc, char(127)));
-        } else {
-            int last = current_history - 1;
-            if (last < 0) last = MAX_HISTORY - 1;
-            history[last].deleted_text.push(halloc, char_at({x(), position.y}));
-            history[last].text.push(halloc, 127);
-            position = remove_at({x(), position.y});
-            history[last].position = position;
-            // history[last].position = position;
-        }
-        broken_edit = false;
+        // if (selection_start != Vector2i(-1, -1)) {
+        //     backspace();
+        // } else if (broken_edit) {
+        //     edit(String(halloc, char(127)));
+        // } else {
+        //     int last = current_history - 1;
+        //     if (last < 0) last = MAX_HISTORY - 1;
+        //     history[last].deleted_text.push(halloc, char_at({x(), position.y}));
+        //     history[last].text.push(halloc, 127);
+        //     position = remove_at({x(), position.y});
+        //     history[last].position = position;
+        //     // history[last].position = position;
+        // }
+        // broken_edit = false;
     }
 
     Vector2i remove_at(Vector2i at) {
@@ -771,6 +795,7 @@ struct Buffer {
         position = at;
 
         flags |= NEEDS_RETOKENIZE;
+        flags |= MODIFIED;
 
         // // TODO: delete entire lines where possible
         // if (selection_start != Vector2i(-1, -1)) {
@@ -954,6 +979,7 @@ struct Buffer {
             return;
         }
 
+        flags |= MODIFIED;
         flags |= NEEDS_RETOKENIZE;
 
         if (selection_start != Vector2i(-1, -1)) {
@@ -1002,26 +1028,39 @@ struct Buffer {
     }
 
     void load(StrView path) {
-        history = halloc.array<Edit>(MAX_HISTORY);
-        file = String(halloc, path);
+        // history = halloc.array<Edit>(MAX_HISTORY);
+
+        { // clean up the path
+            println("old: %", path);
+            String tfile = String(talloc, path);
+            tfile = tfile.replace_first("./", "");
+            tfile = tfile.replace("//", "/");
+            
+            int index = tfile.find("/..");
+            while (index != -1) {
+                println("index: %", index);
+                int at = index - 1;
+                for (; at > 0 && tfile[at] != '/'; --at) {
+                    tfile.remove_at(at);
+                }
+                index = tfile.find("/..", index);
+            }
+            tfile = tfile.replace("/..", "");
+
+            file = String(halloc, tfile);
+        }
+
         Arena content_arena;
 
         Error error = OK;
 
-        char *path_cstring = path.tcstr();
+        char *path_cstring = file.view().tcstr();
         if (fs::is_directory(path_cstring)) {
             flags |= READ_ONLY | DIRECTORY;
             DArray<String> files = fs::read_dir(path, &error);
             if (error != OK) return;
 
-            {
-                char *symlinkpath = path_cstring;
-                char actualpath[PATH_MAX+1];
-                char *ptr;
-
-                ptr = realpath(symlinkpath, actualpath);
-                lines.push(halloc, String(halloc, ptr));
-            }
+            lines.push(halloc, fs::get_full_path(file.view().tcstr(), halloc));
 
             lines.push(halloc, String(halloc, ".."));
             for (u32 i = 0; i < files.size(); ++i) {
@@ -1029,7 +1068,8 @@ struct Buffer {
 
                 StringBuilder sb;
                 sb.append(files[i]);
-                if (fs::is_directory(files[i].view().tcstr())) sb.append("/");
+                auto full_path = tprint("%/%", path, files[i].view());
+                if (fs::is_directory(full_path.to_cstr(talloc))) sb.append("/");
                 
                 lines.push(halloc, sb.build(halloc));
             }
@@ -1043,12 +1083,12 @@ struct Buffer {
         flags |= NEEDS_RETOKENIZE;
 
         tokenizer = halloc.single<Tokenizer>();
-        if (!fs::file_exists(path, &error)) {
+        if (!fs::file_exists(file, &error)) {
             lines.push(halloc, String());
             return;
         }
 
-        String contents = fs::read_file(content_arena, path, &error);
+        String contents = fs::read_file(content_arena, file, &error);
         if (error != OK) return;
 
         if (contents.is_empty()) {
@@ -1067,13 +1107,15 @@ struct Buffer {
         for (auto &line: lines) {
             line.free();
         }
-        for (int i = 0; i < MAX_HISTORY; ++i) {
-            history[i].free();
-        }
         lines.free();
         file.free();
         search.free();
-        ::free(history);
+
+        for (auto &edit: history) {
+            edit.free();
+        }
+        history.free();
+        history = {};
 
         if (tokenizer) {
             if (tokenizer->thread.joinable()) tokenizer->thread.join();
@@ -1100,11 +1142,9 @@ struct Global {
     Color keyword_color;
     Color string_color;
     Color number_color;
+    Color punct_color;
 
     OwnedDArray<Buffer> buffers;
-
-    int buffer_index = -1;
-    int last_buffer_index = -1;
 
     float line_spacing = 1.2f;
 
@@ -1130,11 +1170,34 @@ struct Global {
     }
 
     Buffer *current_buffer() {
-        if (buffer_index < 0) return nullptr;
-        return &buffers[buffer_index];
+        if (buffers.is_empty()) return nullptr;
+        return &buffers.back();
+    }
+
+    Buffer *last_buffer() {
+        if (buffers.size() <= 1) return nullptr;
+        return &buffers[buffers.size() - 2];
+    }
+
+    void open_parent_folder(Buffer &buf) {
+        StrView base = buf.file.get_base_dir();
+        if (base.is_empty()) {
+            base = CSV(".");
+        }
+        if (buf.file != base) {
+            open_file(base); 
+        }
     }
 
     void open_file(StrView file) {
+        for (int i = 0; i < buffers.size(); ++i) {
+            if (buffers[i].file == file) {
+                set_buffer(i);
+                vim_mode = VimNormal;
+                return;
+            }
+        }
+
         buffers.push({});
         buffers.back().load(file);
 
@@ -1148,7 +1211,7 @@ struct Global {
         buffers.back().prompt = prompt;
         buffers.back().on_selected = callback;
         buffers.back().lines.push(halloc, String());
-        buffers.back().history = halloc.array<Edit>(MAX_HISTORY);
+        // buffers.back().history = halloc.array<Edit>(MAX_HISTORY);
         
         vim_mode = VimInsert;
 
@@ -1156,11 +1219,9 @@ struct Global {
     }
 
     void set_buffer(int index) {
-        last_buffer_index = buffer_index;
-        buffer_index = index;
-        if (last_buffer_index == -1) {
-            last_buffer_index = buffer_index;
-        }
+        Buffer buffer = buffers[index];
+        buffers.remove_at(index);
+        buffers.push(buffer);
     }
 
     void load_font(float size = 20, bool sdf = false) {
@@ -1227,6 +1288,7 @@ struct Global {
         string_color = Color::hex(0xa9b665ff);
         keyword_color = Color::hex(0xd8a657ff);
         comment_color = Color::hex(0x7c6f64ff);
+        punct_color = Color::hex(0xcc7d49ff);
     }
 
     void compile() {
@@ -1256,18 +1318,19 @@ struct Global {
     void close_buffer(int index) {
         buffers[index].free();
         buffers.remove_at(index);
-        if (last_buffer_index >= index) last_buffer_index -= 1;
-        if (buffer_index >= index) buffer_index -= 1;
     }
 
     void close_current_buffer() {
-        close_buffer(buffer_index);
-        buffer_index = last_buffer_index;
+        if (!buffers.is_empty()) {
+            buffers.back().free();
+            buffers.pop();
+        }
     }
 
     void close_last_buffer() {
-        close_buffer(last_buffer_index);
-        last_buffer_index = -1;
+        if (buffers.size() >= 2) {
+            close_buffer(buffers.size() - 2);
+        }
     }
 
     ~Global() {
@@ -1293,6 +1356,48 @@ inline bool is_control_pressed() {
 
 inline bool is_shift_pressed() {
     return Input::is_pressed(Actions::LeftShift) || Input::is_pressed(Actions::RightShift);
+}
+
+void cmd(Buffer &buffer) {
+    Buffer *last = global.last_buffer();
+
+    bool found = false;
+
+    if (buffer.line() == "w") {
+        found = true;
+        if (last) last->save();
+    }
+
+    if (buffer.line() == "q") {
+        found = true;
+        Jovial::singleton->queue_emit(Events::Quit());
+    }
+
+    DArray<StrView> words = buffer.line().view().split_spaces();
+    if (words.size() >= 2) {
+        if (words[0] == "e") {
+            found = true;
+            global.vim_mode = VimNormal;
+            global.open_file(words[1]);
+            global.close_last_buffer();
+            return;
+        }
+    }
+
+    if (!found) {
+        push_error("Not an editor command");
+    }
+
+    global.vim_mode = VimNormal;
+    global.close_current_buffer();
+}
+
+void search(Buffer &buffer) {
+    if (global.last_buffer()) {
+        global.last_buffer()->search = String(halloc, buffer.line());
+    }
+    global.vim_mode = VimNormal;
+    global.close_current_buffer();
 }
 
 struct VimMotion {
@@ -1454,8 +1559,18 @@ const VimMotion VIM_MOTIONS[] = {
         return true;
 	}},
 
+    {VimNormal, "/", [](Buffer &buf, StrView rest) {
+        global.open_prompt("/", search);
+        return true;
+	}},
+
+    {VimNormal, ":", [](Buffer &buf, StrView rest) {
+        global.open_prompt(":", cmd);
+        return true;
+	}},
+
     {VimNormal, " v", [](Buffer &buf, StrView rest) {
-		global.open_file(buf.file.get_base_dir()); 
+        global.open_parent_folder(buf);
         return true;
 	}},
 
@@ -1535,7 +1650,7 @@ void update_buffer(Global &g, Events::Update &event) {
 
         if (buf->flags & Buffer::NEEDS_RETOKENIZE && buf->tokenizer->done.load()) {
             buf->tokenizer->tokenize(buf->lines, buf->file);
-            buf->flags ^= Buffer::NEEDS_RETOKENIZE;
+            buf->flags &= ~Buffer::NEEDS_RETOKENIZE;
         }
     }
 }
@@ -1568,6 +1683,7 @@ void on_open_file(Buffer &buffer) {
     global.open_file(buffer.line());
     global.close_last_buffer();
 }
+
 
 void set_compile_command(Buffer &buffer) {
     global.compile_command_arena.reset();
@@ -1681,6 +1797,13 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
             case Actions::D:
                 buf->move_y(20);
                 break;
+            case Actions::Semicolon:
+                g.open_prompt(":", cmd);
+                break;
+            case Actions::F:
+            case Actions::Slash:
+                g.open_prompt("/", search);
+                break;
             case Actions::K: {
                 StrView extension = buf->file.get_extension();
 // #define DEFINE_COMMENT(buf, str) \
@@ -1706,14 +1829,16 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
             } break;
             case Actions::O:
                 if (is_shift_pressed()) {
-                    g.open_file(buf->file.get_base_dir());
+                    g.open_parent_folder(*buf);
                 } else {
                     g.open_prompt("Path: ", on_open_file);
                 }
                 return;
-            case Actions::Num6: 
-                g.set_buffer(g.last_buffer_index);
-                return;
+            case Actions::Num6:  {
+                if (g.buffers.size() >= 2) {
+                    g.set_buffer(g.buffers.size() - 2);
+                }
+            } return;
             default: break;
         }
     }
@@ -1821,6 +1946,10 @@ Color get_color(Buffer &buf, FreeFont **font, u64 token_index, u64 i, u64 j) {
             *font = &global.regular;
             color = global.string_color;
         } break;
+        case Token::PUNCT: {
+            *font = &global.regular;
+            color = global.punct_color;
+        } break;
         case Token::NUMBER: {
             *font = &global.regular;
             color = global.number_color;
@@ -1833,8 +1962,12 @@ Color get_color(Buffer &buf, FreeFont **font, u64 token_index, u64 i, u64 j) {
 void draw(Global &g, Events::Draw &e) {
     Buffer *buf = g.current_buffer();
     if (!buf) return;
-    if (!g.buffers[g.buffer_index].prompt.is_empty()) {
-        buf = &g.buffers[g.last_buffer_index];
+    if (!buf->prompt.is_empty()) {
+        if (g.buffers.size() >= 2) {
+            buf = &g.buffers[g.buffers.size() - 2];
+        } else {
+            buf = nullptr;
+        }
     }
 
     ui::Layout layout(talloc, {{0, 0}, WM::get_main_window()->get_size()});
@@ -1844,7 +1977,8 @@ void draw(Global &g, Events::Draw &e) {
         Rect2 rect = layout.push_percent(ui::BOTTOM, line_percent, 1 - line_percent);
         Renderer2D::from(e.renderers[0])->set_scissor(rect);
 
-        StrView msg = tprint("%:%:%", buf->file, buf->position.y + 1, buf->position.x + 1);
+        StrView modified = buf->flags & Buffer::MODIFIED ? "[+] " : "";
+        StrView msg = tprint("%%:%:%", modified, buf->file, buf->position.y + 1, buf->x() + 1);
         ui::label(e.renderers[0], g.regular, rect, msg, g.theme.primary, ui::RIGHT);
         ui::label(e.renderers[0], g.regular, rect, g.compile_command.is_empty() ? "no compile command" : g.compile_command, g.theme.muted, ui::CENTER);
         
@@ -2022,8 +2156,8 @@ void draw(Global &g, Events::Draw &e) {
     }
 
      // prompt
-    if (!g.buffers[g.buffer_index].prompt.is_empty()) {
-        buf = &g.buffers[g.buffer_index];
+    if (!g.current_buffer()->prompt.is_empty()) {
+        buf = g.current_buffer();
 
         Vector2 size(pad * 2, g.regular.size * g.line_spacing + pad);
         g.regular.measure(size, buf->prompt);
