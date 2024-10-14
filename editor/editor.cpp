@@ -1,3 +1,4 @@
+#include "Templates/AssocArray.h"
 #define JV_FREETYPE_SUPPORT
 
 #ifdef BUNDLE_FONT
@@ -544,6 +545,7 @@ struct Buffer {
         copied_flash.restart(0.15);
         copied_flash_position = position;
         copied_flash_start = selection_start;
+        selection_start = Vector2i(-1, -1);
     }
 
     String selected_text(Allocator alloc = talloc) {
@@ -1168,6 +1170,10 @@ struct Global {
 
     OwnedDArray<Buffer> buffers;
 
+    Arena macro_arena;
+    AssocArray<char, String> macros;
+    char recording_macro = '\0';
+
     float line_spacing = 1.2f;
 
     StrView compile_command;
@@ -1528,6 +1534,8 @@ done:
         push_error("Not an editor command");
     }
 
+    last->selection_start = Vector2i(-1, -1);
+
     global.vim_mode = VimNormal;
     global.close_current_buffer();
 }
@@ -1596,6 +1604,12 @@ const VimMotion VIM_MOTIONS[] = {
             buf.position.x = pos - 1;
         }
 
+        return true;
+	}},
+
+    {VimNormal | VimVisual | VimVisualLine, "q", [](Buffer &buf, StrView rest) {
+        if (rest.is_empty()) return false; 
+        global.recording_macro = rest[0];
         return true;
 	}},
 
@@ -1861,7 +1875,7 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
 
     // Handle directory-related actions
     if (buf->flags & Buffer::DIRECTORY) {
-        if (event.keycode == Actions::Enter || Input::just_double_clicked()) {
+        if (event.keycode == Actions::Enter) {
 #ifdef _WIN32
             g.open_file(tprint("%\\%", buf->file, buf->line()));
 #else
@@ -1901,6 +1915,11 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
             }
             default: break;
         }
+    }
+
+    if (event.keycode == Actions::Escape) {
+        g.recording_macro = 0;
+        return;
     }
 
     // Handle prompt-related actions
@@ -2071,9 +2090,21 @@ void update_mouse(Global &g, Events::Update &event) {
         }
     }
 
+    if (Input::just_double_clicked()) {
+        if (buf->flags & Buffer::DIRECTORY) {
+#ifdef _WIN32
+            g.open_file(tprint("%\\%", buf->file, buf->line()));
+#else
+            g.open_file(tprint("%/%", buf->file, buf->line()));
+#endif
+            g.close_last_buffer();
+        }
+    }
+
     if (Input::get_scroll() != 0) {
-        buf->cam_offset += Input::get_scroll() * 2;
-        buf->move_y(0);
+        int scroll = Input::get_scroll() * 2;
+        buf->move_y(scroll);
+        buf->cam_offset += scroll;
     }
 }
 
@@ -2139,10 +2170,14 @@ void draw(Global &g, Events::Draw &e) {
         ui::label(e.renderers[0], g.regular, rect, msg, g.theme.primary, ui::RIGHT);
         ui::label(e.renderers[0], g.regular, rect, g.compile_command.is_empty() ? "no compile command" : g.compile_command, g.theme.muted, ui::CENTER);
         
-        if (g.bindings == VIM_BINDINGS) {
-            ui::label(e.renderers[0], g.regular, rect, tprint("Vim: % %", vim_mode_to_string(g.vim_mode), g.command), g.theme.muted, ui::LEFT);
-        } else if (g.bindings == MOUSE_BINDINGS) {
-            ui::label(e.renderers[0], g.regular, rect, "Mouse", g.theme.muted, ui::LEFT);
+        if (g.recording_macro != 0) {
+            ui::label(e.renderers[0], g.regular, rect, tprint("recording macro @%", g.recording_macro), g.theme.primary, ui::LEFT);
+        } else {
+            if (g.bindings == VIM_BINDINGS) {
+                ui::label(e.renderers[0], g.regular, rect, tprint("Vim: % %", vim_mode_to_string(g.vim_mode), g.command), g.theme.muted, ui::LEFT);
+            } else if (g.bindings == MOUSE_BINDINGS) {
+                ui::label(e.renderers[0], g.regular, rect, "Mouse", g.theme.muted, ui::LEFT);
+            }
         }
 
         layout.pop();
