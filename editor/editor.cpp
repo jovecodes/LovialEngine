@@ -1387,20 +1387,22 @@ inline bool is_shift_pressed() {
 
 void cmd(Buffer &buffer) {
     Buffer *last = global.last_buffer();
+    if (buffer.line().is_empty()) return;
+    String &prompt = buffer.line();
 
     bool found = false;
 
-    if (buffer.line() == "w") {
+    if (prompt == "w") {
         found = true;
         if (last) last->save();
     }
 
-    if (buffer.line() == "q") {
+    if (prompt == "q") {
         found = true;
         Jovial::singleton->queue_emit(Events::Quit());
     }
 
-    DArray<StrView> words = buffer.line().view().split_spaces();
+    DArray<StrView> words = prompt.view().split_spaces();
     if (words.size() >= 2) {
         if (words[0] == "e") {
             found = true;
@@ -1411,6 +1413,117 @@ void cmd(Buffer &buffer) {
         }
     }
 
+    // TODO: 
+    //  - Confirmation
+    //  - Being able to see the change as you type
+    //  - Undo support
+    //  - sed commands ie . * ^ \(\) [] \n etc
+    if (prompt.find("s/") != -1) {
+        found = true;
+
+        bool whole_file = false;
+        bool is_global = false;
+        bool confirm = false;
+        
+        bool escape = false;
+
+        enum {
+            PREFIX,
+            FIND,
+            REPLACE,
+            POSTFIX,
+        };
+        int mode = PREFIX;
+
+        String find;
+        String replace;
+
+        for (auto c: prompt) {
+            if (c == '\\' && !escape) {
+                escape = true;
+                continue;
+            }
+
+            if (mode == PREFIX) {
+                if (c == 's') {
+                    continue;
+                } else if (c == '%') {
+                    whole_file = true;
+                } else if (c == '/' && !escape) {
+                    mode += 1;
+                } else {
+                    push_error("unknown prefix flag '%c'", c);
+                }
+            } else if (mode == FIND) {
+                if (!escape && c == '/') {
+                    mode += 1;
+                } else {
+                    find.push(talloc, c);
+                }
+            } else if (mode == REPLACE) {
+                if (!escape && c == '/') {
+                    mode += 1;
+                } else {
+                    replace.push(talloc, c);
+                }
+            } else if (mode == POSTFIX) {
+                if (c == 'g') {
+                    is_global = true;
+                } else if (c == 'c') {
+                    confirm = true;
+                } else {
+                    push_error("unknown postfix flag '%c'", c);
+                }
+            } else {
+                push_error("extraneous '/' found in find and replace");
+                goto done;
+            }
+
+            escape = false;
+        }
+
+                    println("% -> %", find, replace);
+        if (!confirm) {
+            if (whole_file) {
+                for (int i = 0; i < last->lines.size(); ++i) {
+                    if (is_global) {
+                        String res = last->lines[i].replace(find, replace, halloc);
+                        last->lines[i].free();
+                        last->lines[i] = res;
+                    } else {
+                        String res = last->lines[i].replace_first(find, replace, halloc);
+                        last->lines[i].free();
+                        last->lines[i] = res;
+                    }
+                }
+            } else {
+                Vector2i start = Buffer::is_pos_less_or_equal(last->selection_start, last->position) ? last->selection_start : last->position;
+                Vector2i end = Buffer::is_pos_less_or_equal(last->selection_start, last->position) ? last->position : last->selection_start;
+
+                for (int i = start.y; i <= end.y; ++i) {
+                    if (is_global) {
+                        String res = last->lines[i].replace(find, replace, halloc);
+                        last->lines[i].free();
+                        last->lines[i] = res;
+                    } else {
+                        String res = last->lines[i].replace_first(find, replace, halloc);
+                        last->lines[i].free();
+                        last->lines[i] = res;
+                    }
+                }
+            }
+            last->flags |= Buffer::MODIFIED;
+            last->flags |= Buffer::UNSAVED;
+            last->flags |= Buffer::NEEDS_RETOKENIZE;
+
+            last->move_x(0);
+        } else {
+            push_error("Confirmation for find a replace is not implemented yet!");
+        }
+    }
+
+
+done:
     if (!found) {
         push_error("Not an editor command");
     }
@@ -1594,12 +1707,12 @@ const VimMotion VIM_MOTIONS[] = {
         return true;
 	}},
 
-    {VimNormal, "/", [](Buffer &buf, StrView rest) {
+    {VimNormal | VimVisual | VimVisualLine, "/", [](Buffer &buf, StrView rest) {
         global.open_prompt("/", search);
         return true;
 	}},
 
-    {VimNormal, ":", [](Buffer &buf, StrView rest) {
+    {VimNormal | VimVisual | VimVisualLine, ":", [](Buffer &buf, StrView rest) {
         global.open_prompt(":", cmd);
         return true;
 	}},
