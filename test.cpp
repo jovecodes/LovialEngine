@@ -5,5 +5,3 @@ int main() {
 void thing() {
     return x == y;
 }
-
-the end

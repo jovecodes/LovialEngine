@@ -94,19 +94,18 @@ struct Token {
         KEYWORD,
         COMMENT,
         STRING,
+        NUMBER,
     } type;
 };
 
 static const StrView CPP_KEYWORDS[] = {
-    CSV("void"),
     CSV("struct"),
     CSV("enum"),
     CSV("class"),
-    CSV("const"),
-    CSV("static"),
     CSV("return"),
 
     CSV("if"),
+    CSV("else"),
     CSV("for"),
     CSV("while"),
     CSV("switch"),
@@ -123,6 +122,12 @@ static const StrView CPP_KEYWORDS[] = {
     CSV("#ifdef"),
     CSV("#ifndef"),
 
+    CSV("const"),
+    CSV("static"),
+    CSV("inline"),
+    CSV("extern"),
+
+    CSV("void"),
     CSV("int"),
     CSV("float"),
     CSV("long"),
@@ -222,7 +227,36 @@ struct Tokenizer {
     }
 
     bool _handle_string(u64 &i, u64 &line, u32 &line_offset) {
-        if (file[i] == '"') {
+        if (file[i] == '\'') {
+            char *pointer = file.ptr() + i;
+            u32 start = line_offset;
+            u64 start_line = line;
+            i += 1, line_offset += 1;
+
+            bool escape = false;
+            while (i < file.size()) {
+                if (file[i] == '\n') {
+                    line_offset = 0;
+                    line++;
+                } else {
+                    line_offset++;
+                }
+
+                // Handle escaped characters
+                if (escape) {
+                    escape = false;  // Reset escape flag after processing the escape
+                } else if (file[i] == '\\') {
+                    escape = true;   // Set escape flag when encountering backslash
+                } else if (file[i] == '\'') {
+                    break;  // End of string
+                }
+
+                i++;  // Move to the next character
+            }
+            
+            tokens.push(halloc, {start_line, line, start, line_offset, Token::STRING});
+            return true;
+        } else if (file[i] == '"') {
             char *pointer = file.ptr() + i;
             u32 start = line_offset;
             u64 start_line = line;
@@ -249,7 +283,7 @@ struct Tokenizer {
                 i++;  // Move to the next character
             }
             
-            tokens.push(halloc, {line, line, start, line_offset, Token::STRING});
+            tokens.push(halloc, {start_line, line, start, line_offset, Token::STRING});
             return true;
         }
         return false;
@@ -261,7 +295,7 @@ struct Tokenizer {
             u32 start = line_offset;
             i += 1, line_offset += 1;
 
-            while (i < file.size() && (isalpha(file[i]) || file[i] == '_' || file[i] == '#')) {
+            while (i < file.size() && (isalnum(file[i]) || file[i] == '_' || file[i] == '#')) {
                 i++, line_offset++;
             }
 
@@ -278,6 +312,24 @@ struct Tokenizer {
         return false;
     }
 
+    bool _handle_numbers(u64 &i, u64 &line, u32 &line_offset, StrView extras) {
+        if (isdigit(file[i])) {
+            char *pointer = file.ptr() + i;
+            u32 start = line_offset;
+            i += 1, line_offset += 1;
+
+            while (i < file.size() && (isdigit(file[i]) || file[i] == '.' || extras.find_char(file[i]) != -1)) {
+                i++, line_offset++;
+            }
+
+            tokens.push(halloc, {line, line, start, line_offset, Token::NUMBER});
+
+            --i;
+            return true;
+        }
+        return false;
+    }
+
     void _lua_tokenize() {
         u64 line = 0;
         u32 line_offset = 0;
@@ -286,6 +338,7 @@ struct Tokenizer {
             if (_handle_single_line_comment(i, line, line_offset, "--")) continue;
             if (_handle_multi_line_comment(i, line, line_offset, "--[[", "]]--")) continue;
             if (_handle_string(i, line, line_offset)) continue;
+            if (_handle_numbers(i, line, line_offset, "")) continue;
             if (_handle_keywords(i, line, line_offset, LUA_KEYWORDS)) continue;
             ++line_offset;
         }
@@ -299,6 +352,7 @@ struct Tokenizer {
             if (_handle_single_line_comment(i, line, line_offset, "//")) continue;
             if (_handle_multi_line_comment(i, line, line_offset, "/*", "*/")) continue;
             if (_handle_string(i, line, line_offset)) continue;
+            if (_handle_numbers(i, line, line_offset, "fe")) continue;
             if (_handle_keywords(i, line, line_offset, CPP_KEYWORDS)) continue;
             ++line_offset;
         }
@@ -397,6 +451,68 @@ struct Buffer {
         broken_edit = true;
     }
 
+    int get_indent_at(int line) {
+        View<StrView> opens, closes;
+        StrView extension = file.get_extension();
+        if (extension == "c" || extension == "cpp" || extension == "rs") {
+            static const StrView OPENS[] = {
+                CSV("{"),
+                CSV("("),
+            };
+            static const StrView CLOSES[] = {
+                CSV("}"),
+                CSV(")"),
+            };
+
+            opens = OPENS;
+            closes = CLOSES;
+        } else if (extension == "lua") {
+            static const StrView OPENS[] = {
+                CSV("function"),
+                CSV("if"),
+                CSV("{"),
+                CSV("("),
+            };
+            static const StrView CLOSES[] = {
+                CSV("end"),
+                CSV("}"),
+                CSV(")"),
+            };
+            opens = OPENS;
+            closes = CLOSES;
+        }
+
+        int indent = 0;
+        for (u64 i = 0; i < line; ++i) {
+            int offset = 0;
+            for (u64 j = 0; j < opens.size(); ++j) {
+                while (true) {
+                    int new_offset = lines[i].find(opens[j], offset);
+                    if (new_offset == -1) {
+                        break;
+                    } else {
+                        offset = math::max(offset, new_offset + 1);
+                        indent = math::max(indent + 1, 0);
+                        if (offset >= lines[i].size()) break;
+                    }
+                }
+            }
+            for (u64 j = 0; j < closes.size(); ++j) {
+                while (true) {
+                    int new_offset = lines[i].find(closes[j], offset);
+                    if (new_offset == -1) {
+                        break;
+                    } else {
+                        offset = math::max(offset, new_offset + 1);
+                        indent = math::max(indent - 1, 0);
+                        if (offset >= lines[i].size()) break;
+                    }
+                }
+            }
+        }
+        return indent;
+    }
+
     void copy() {
         clipboard::set(WM::get_main_window_id(), selected_text().to_cstr(talloc));
         copied_flash.restart(0.15);
@@ -435,6 +551,7 @@ struct Buffer {
     }
 
     void perform(Edit &edit) {
+        if (flags & READ_ONLY) return;
         position = edit.start_position;
 
         for (auto c: edit.text) {
@@ -442,8 +559,8 @@ struct Buffer {
                 edit.deleted_text.push(halloc, char_at({x() - 1, position.y}));
                 position = remove_at({x() - 1, position.y});
             } else if (c == 127) {
-                edit.deleted_text.push(halloc, char_at(position));
-                position = remove_at(position);
+                edit.deleted_text.push(halloc, char_at({x(), position.y}));
+                position = remove_at({x(), position.y});
             } else {
                 insert_char(c);
             }
@@ -451,14 +568,15 @@ struct Buffer {
     }
 
     void undo_edit(Edit edit) {
+        if (flags & READ_ONLY) return;
         position = edit.position;
         int delete_index = edit.deleted_text.size() - 1;
         for (int i = 0; i < edit.text.size(); ++i) {
             if (edit.text[i] == '\b') {
                 insert_char(edit.deleted_text[delete_index--]);
             } else if (edit.text[i] == 127) {
-                move_x(1);
-                insert_char(edit.deleted_text[delete_index++]);
+                insert_char(edit.deleted_text[delete_index--]);
+                move_x(-1);
             } else {
                 if (edit.text[i] == '\n') {
                     move_y(1);
@@ -471,6 +589,7 @@ struct Buffer {
     }
 
     void undo() {
+        if (flags & READ_ONLY) return;
         current_history -= 1;
         if (current_history < 0) current_history = MAX_HISTORY - 1;
 
@@ -485,6 +604,7 @@ struct Buffer {
     }
 
     void redo() {
+        if (flags & READ_ONLY) return;
         if (undo_level <= 0 || history[current_history].text.is_empty()) {
             push_error("already at newest change");
             return;
@@ -504,7 +624,8 @@ struct Buffer {
         current_history = (current_history + 1) % MAX_HISTORY;
     }
 
-    void insert(char c) {
+    void insert(char c, int extra_indent = 0) {
+        if (flags & READ_ONLY) return;
         if (!prompt.is_empty() && c == '\n') {
             on_selected(*this);
             return;
@@ -520,7 +641,33 @@ struct Buffer {
             history[last].text.push(halloc, c);
             insert_char(c);
         }
+
+        if (c == '\n') {
+            int indent = math::max(get_indent_at(position.y) + extra_indent, 0);
+            for (int i = 0; i < indent; ++i) {
+                for (int j = 0; j < TAB_WIDTH; ++j) {
+                    insert(' ');
+                }
+            }
+        }
+
         broken_edit = false;
+    }
+
+    void user_insert(char c) {
+        if (c == '{' && x() >= line().size()) {
+            insert(c);
+            Vector2i pos = position;
+            insert('}');
+            position = pos;
+        } else if (c == '\n' && x() > 0 && x() < line().size() && line()[x()] == '}') {
+            insert(c);
+            Vector2i pos = position;
+            insert(c, -1);
+            position = pos;
+        } else {
+            insert(c);
+        }
     }
 
     char char_at(Vector2i at) {
@@ -534,6 +681,7 @@ struct Buffer {
     }
 
     void _backspace() {
+        if (flags & READ_ONLY) return;
         if (selection_start != Vector2i(-1, -1)) {
             Vector2i start = is_pos_less_or_equal(selection_start, position) ? selection_start : position;
             Vector2i end = is_pos_less_or_equal(selection_start, position) ? position : selection_start;
@@ -564,7 +712,7 @@ struct Buffer {
         } else {
             int last = current_history - 1;
             if (last < 0) last = MAX_HISTORY - 1;
-            if (history[last].text.size() >= 1 && history[last].text.back() != '\b') {
+            if (history[last].text.size() >= 1 && history[last].text.back() != '\b' && history[last].text.back() != 127) {
                 history[last].text.pop();
             } else {
                 history[last].deleted_text.push(halloc, char_at({x() - 1, position.y}));
@@ -579,7 +727,7 @@ struct Buffer {
 
     void backspace() {
         int _x = x();
-        if (_x >= line().size()) _x = line().size() - 1;
+        math::CLAMP(_x, 0, (int) line().size() - 1);
         if (_x >= TAB_WIDTH) {
             bool tab = true;
             for (int i = 0; i < TAB_WIDTH; ++i) {
@@ -594,18 +742,29 @@ struct Buffer {
         _backspace();
     }
 
-    // void del() {
-    //     char ch = 127;
-    //     if (broken_edit) {
-    //         position = edit({position, String(halloc, ch)});
-    //         broken_edit = false;
-    //     } else {
-    //         int last = current_history - 1;
-    //         if (last < 0) last = MAX_HISTORY - 1;
-    //         history[last].text.push(halloc, ch);
-    //         position = remove_at(position);
-    //     }
-    // }
+    void del() {
+        JV_LOG_ENGINE(LOG_WARNING, "TODO: the undo on delete is broken.");
+
+        if (position.x >= line().size()) {
+            backspace();
+            return;
+        }
+
+        if (selection_start != Vector2i(-1, -1)) {
+            backspace();
+        } else if (broken_edit) {
+            edit(String(halloc, char(127)));
+        } else {
+            int last = current_history - 1;
+            if (last < 0) last = MAX_HISTORY - 1;
+            history[last].deleted_text.push(halloc, char_at({x(), position.y}));
+            history[last].text.push(halloc, 127);
+            position = remove_at({x(), position.y});
+            history[last].position = position;
+            // history[last].position = position;
+        }
+        broken_edit = false;
+    }
 
     Vector2i remove_at(Vector2i at) {
         Vector2i old_position = position;
@@ -703,6 +862,73 @@ struct Buffer {
         // cam_offset = math::CLAMPED(cam_offset, 0, (int) lines.size() - 1);
 
         math::CLAMP(position.y, 0, (int) lines.size() - 1);
+    }
+
+    // returns if the move was 'successful'
+    bool move_x_wrap(int amount) {
+        if (amount >= 0) {
+            move_x(amount);
+            if (x() >= line().size()) {
+                if (position.y != lines.size() - 1) {
+                    position.x = 0;
+                    move_y(1);
+                } else {
+                    position.x = line().size() - 1;
+                    return false;
+                }
+            }
+        } else {
+            println("amount: %, x: %", amount, x());
+            if (x() <= -amount) {
+                if (position.y != 0) {
+                    move_y(-1);
+                    position.x = line().size() - 1;
+                } else {
+                    position.x = 0;
+                    return false;
+                }
+            } else {
+                move_x(amount);
+            }
+        }
+        return true;
+    }
+
+    bool is_current_char(bool (*check)(char)) {
+        if (lines.is_empty()) return false;
+        if (x() < 0 || x() >= line().size()) return check('\n');
+        return check(line()[x()]);
+    }
+
+    bool is_current_char(int (*check)(int)) {
+        if (lines.is_empty()) return false;
+        if (x() < 0 || x() >= line().size()) return check('\n');
+        return check(line()[x()]);
+    }
+
+    static bool is_ident(char c) {
+        return isalnum(c) || c == '_';
+    }
+
+    void word_move(int direction) {
+        move_x_wrap(0);
+
+        if (is_current_char(ispunct)) {
+            while (is_current_char(ispunct)) {
+                if (!move_x_wrap(direction)) return;
+            }
+        } else if (is_current_char(is_ident)) {
+            while (is_current_char(is_ident)) {
+                if (!move_x_wrap(direction)) return;
+            }
+        }
+
+        move_x_wrap(0);
+        while (is_current_char(isspace)) {
+            while (is_current_char(isspace)) {
+                if (!move_x_wrap(direction)) return;
+            }
+        }
     }
 
     void move_x(int amount) {
@@ -865,12 +1091,15 @@ enum Bindings {
 };
 
 struct Global {
-    FreeFont font;
+    FreeFont regular;
+    FreeFont bold;
+    FreeFont italic;
 
     ui::Theme theme;
     Color comment_color;
     Color keyword_color;
     Color string_color;
+    Color number_color;
 
     OwnedDArray<Buffer> buffers;
 
@@ -936,9 +1165,17 @@ struct Global {
 
     void load_font(float size = 20, bool sdf = false) {
         using_sdf = sdf;
-        if (font.is_loaded()) {
-            font.unload();
-            font = {};
+        if (regular.is_loaded()) {
+            regular.unload();
+            regular = {};
+        }
+        if (bold.is_loaded()) {
+            bold.unload();
+            bold = {};
+        }
+        if (italic.is_loaded()) {
+            italic.unload();
+            italic = {};
         }
 
 #ifdef BUNDLE_FONT
@@ -950,13 +1187,21 @@ struct Global {
             freetype_set_anti_aliasing_factor(BITMAP_AA);
         }
 #else
-        const char *path = "./editor/jet_brains.ttf";
-        JV_ASSERT(fs::file_exists(path, nullptr));
+        const char *regular_path = "editor/fonts/ttf/JetBrainsMono-Regular.ttf";
+        const char *bold_path = "editor/fonts/ttf/JetBrainsMono-Bold.ttf";
+        const char *italic_path = "editor/fonts/ttf/JetBrainsMono-Italic.ttf";
+        JV_ASSERT(fs::file_exists(regular_path, nullptr));
+        JV_ASSERT(fs::file_exists(bold_path, nullptr));
+        JV_ASSERT(fs::file_exists(italic_path, nullptr));
         if (sdf) {
-            font.load(path, size, FreeFont::SDF);
+            regular.load(regular_path, size, FreeFont::SDF);
+            bold.load(bold_path, size, FreeFont::SDF);
+            italic.load(italic_path, size, FreeFont::SDF);
             freetype_set_anti_aliasing_factor(SDF_AA);
         } else {
-            font.load(path, size, FreeFont::BITMAP);
+            regular.load(regular_path, size, FreeFont::BITMAP);
+            bold.load(bold_path, size, FreeFont::BITMAP);
+            italic.load(italic_path, size, FreeFont::BITMAP);
             freetype_set_anti_aliasing_factor(BITMAP_AA);
         }
 #endif
@@ -973,14 +1218,15 @@ struct Global {
         theme.secondary = Colors::GRUVBOX_GREY;
         theme.accent = Colors::BLACK;
         theme.text_color = Colors::WHITE;
-        theme.normal_font = &font;
+        theme.normal_font = &regular;
         theme.muted = Colors::GRUVBOX_LIGHTGRAY.lightened(0.1);
         theme.outline_thickness = 3.0f;
         theme.text_padding = 10.0f;
 
+        number_color = Color::hex(0xd3869bff);
         string_color = Color::hex(0xa9b665ff);
         keyword_color = Color::hex(0xd8a657ff);
-        comment_color = Color::hex(0x7c6f64ff); // hello
+        comment_color = Color::hex(0x7c6f64ff);
     }
 
     void compile() {
@@ -1028,7 +1274,9 @@ struct Global {
         for (auto &buffer: buffers) {
             buffer.free();
         }
-        font.unload();
+        if (regular.is_loaded()) regular.unload();
+        if (bold.is_loaded()) bold.unload();
+        if (italic.is_loaded()) italic.unload();
 
         for (auto e: errors) e.text.free();
         errors.free();
@@ -1110,7 +1358,15 @@ const VimMotion VIM_MOTIONS[] = {
         StrView res = vim_move(rest, false);
 
         if (buf.position != buf.selection_start) {
-            if (buf.position.y != buf.selection_start.y) buf.select_lines = true;
+            if (buf.position.y != buf.selection_start.y) {
+                buf.select_lines = true;
+            } else {
+                if (buf.position.x < buf.selection_start.x) {
+                    buf.selection_start.x -= 1;
+                } else {
+                    buf.position.x -= 1;
+                }
+            }
 
             buf.backspace();
             buf.selection_start = Vector2i(-1, -1);
@@ -1120,6 +1376,24 @@ const VimMotion VIM_MOTIONS[] = {
         } else {
             return res != rest;
         }
+	}},
+
+    {VimNormal, "w", [](Buffer &buf, StrView rest) {
+        buf.word_move(1);
+        return true;
+	}},
+
+    {VimNormal, "b", [](Buffer &buf, StrView rest) {
+        buf.word_move(-1);
+        return true;
+	}},
+
+    {VimNormal, "C", [](Buffer &buf, StrView rest) {
+        if (buf.position.x < buf.line().size()) {
+            buf.line().resize(halloc, buf.position.x);
+        }
+		global.vim_mode = VimInsert; 
+        return true;
 	}},
 
     {VimNormal | VimVisual | VimVisualLine, "gg", [](Buffer &buf, StrView rest) {
@@ -1133,22 +1407,29 @@ const VimMotion VIM_MOTIONS[] = {
 	}},
 
     {VimNormal | VimVisual | VimVisualLine, "o", [](Buffer &buf, StrView rest) {
-		buf.position.x = buf.line().size(); buf.insert('\n'); global.vim_mode = VimInsert; 
+		buf.position.x = buf.line().size();
+		buf.user_insert('\n');
+		global.vim_mode = VimInsert; 
         return true;
 	}},
 
     {VimNormal | VimVisual | VimVisualLine, "O", [](Buffer &buf, StrView rest) {
-		buf.move_y(1); buf.position.x = buf.line().size(); buf.insert('\n'); global.vim_mode = VimInsert; 
+		buf.move_y(1); 
+        buf.position.x = buf.line().size(); 
+        buf.user_insert('\n'); 
+        global.vim_mode = VimInsert; 
         return true;
 	}},
 
     {VimNormal | VimVisual | VimVisualLine, "a", [](Buffer &buf, StrView rest) {
-		buf.move_x(1); global.vim_mode = VimInsert; 
+		buf.move_x(1); 
+        global.vim_mode = VimInsert; 
         return true;
 	}},
 
     {VimNormal | VimVisual | VimVisualLine, "A", [](Buffer &buf, StrView rest) {
-		buf.move_x(buf.line().size()); global.vim_mode = VimInsert; 
+		buf.move_x(buf.line().size());
+		global.vim_mode = VimInsert;
         return true;
 	}},
 
@@ -1168,7 +1449,8 @@ const VimMotion VIM_MOTIONS[] = {
 	}},
 
     {VimNormal, "dd", [](Buffer &buf, StrView rest) {
-		buf.select_line(); buf.backspace(); 
+		buf.select_line(); 
+        buf.backspace(); 
         return true;
 	}},
 
@@ -1183,12 +1465,14 @@ const VimMotion VIM_MOTIONS[] = {
 	}},
 
     {VimNormal, "v", [](Buffer &buf, StrView rest) {
-		buf.selection_start = buf.position; global.vim_mode = VimVisual; 
+		buf.selection_start = buf.position;
+		global.vim_mode = VimVisual;
         return true;
 	}},
 
     {VimNormal, "V", [](Buffer &buf, StrView rest) {
-		buf.selection_start = buf.position; global.vim_mode = VimVisualLine; 
+		buf.selection_start = buf.position;
+		global.vim_mode = VimVisualLine;
         return true;
 	}},
 
@@ -1198,12 +1482,14 @@ const VimMotion VIM_MOTIONS[] = {
 	}},
 
     {VimVisual | VimVisualLine, "y", [](Buffer &buf, StrView rest) {
-		buf.copy(); global.vim_mode = VimNormal; 
+		buf.copy();
+		global.vim_mode = VimNormal;
         return true;
 	}},
 
     {VimVisual | VimVisualLine, "d", [](Buffer &buf, StrView rest) {
-		buf.backspace(); global.vim_mode = VimNormal; 
+		buf.backspace();
+		global.vim_mode = VimNormal;
         return true;
 	}},
 };
@@ -1265,14 +1551,16 @@ void on_typed(Global &g, Events::KeyTyped &event) {
         if (g.command != res) {
             g.flush_command();
             g.command.append(halloc, res);
+
+            return;
         }
 
         if (g.vim_mode == VimInsert) {
-            buf->insert(event.character);
+            buf->user_insert(event.character);
             g.flush_command();
         }
     } else {
-        buf->insert_char(event.character);
+        buf->user_insert(event.character);
     }
 }
 
@@ -1325,16 +1613,16 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
             case Actions::Backspace: {
                 buf->backspace();
              } break;
-            // case Actions::Delete:
-            //     buf->del();
-            //     break;
+            case Actions::Delete:
+                buf->del();
+                break;
             case Actions::Enter: {
-                 buf->insert('\n');
+                 buf->user_insert('\n');
                  return;
             }
             case Actions::Tab: {
                 for (int i = 0; i < TAB_WIDTH; ++i) {
-                    buf->insert_char(' ');
+                    buf->insert(' ');
                 }
                 return;
             }
@@ -1379,10 +1667,10 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
                 g.compile();
                 break;
             case Actions::Equal:
-                g.load_font(g.font.size + 2);
+                g.load_font(g.regular.size + 2);
                 break;
             case Actions::Minus:
-                g.load_font(g.font.size - 2);
+                g.load_font(g.regular.size - 2);
                 break;
             case Actions::Num0:
                 g.load_font();
@@ -1457,7 +1745,7 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
     // Handle function keys
     switch (event.keycode) {
         case Actions::F1:
-            g.load_font(g.font.size, !g.using_sdf);
+            g.load_font(g.regular.size, !g.using_sdf);
             break;
         case Actions::F2:
             g.bindings = (g.bindings == VIM_BINDINGS) ? MOUSE_BINDINGS : VIM_BINDINGS;
@@ -1472,14 +1760,14 @@ void update_mouse(Global &g, Events::Update &event) {
 
     if (Input::is_pressed(Actions::LeftMouseButton)) {
         ui::Layout layout(talloc, {{0, 0}, WM::get_main_window()->get_size()});
-        const float line_percent = 1 - (g.font.size * g.line_spacing * 2) / WM::get_main_window()->get_height();
+        const float line_percent = 1 - (g.regular.size * g.line_spacing * 2) / WM::get_main_window()->get_height();
         const char *line_number_fmt = " % ";
         StrView max_number = tprint(line_number_fmt, buf->lines.size());
         Vector2 offset;
-        g.font.measure(offset, max_number);
+        g.regular.measure(offset, max_number);
 
         float y = WM::get_main_window()->get_height() - Input::get_mouse_position().y;
-        y /= global.font.size * global.line_spacing;
+        y /= global.regular.size * global.line_spacing;
         y = math::floor(y);
 
         float x = Input::get_mouse_position().x - offset.x;
@@ -1488,7 +1776,7 @@ void update_mouse(Global &g, Events::Update &event) {
 
         buf->position.x = 0;
         while (buf->position.x < buf->line().size()) {
-            x -= g.font.metrics[' '].advance.x;
+            x -= g.regular.metrics[' '].advance.x;
             if (x <= 0) {
                 break;
             }
@@ -1507,7 +1795,7 @@ void update_mouse(Global &g, Events::Update &event) {
     }
 }
 
-Color get_color(Buffer &buf, u64 token_index, u64 i, u64 j) {
+Color get_color(Buffer &buf, FreeFont **font, u64 token_index, u64 i, u64 j) {
     Color color = global.theme.primary;
 
     if (token_index >= buf.tokens.size()) return color;
@@ -1518,17 +1806,25 @@ Color get_color(Buffer &buf, u64 token_index, u64 i, u64 j) {
     if (buf.tokens[token_index].end_line == i && j > buf.tokens[token_index].end) return color;
 
     switch (buf.tokens[token_index].type) {
-        case Token::NORMAL:
-            break;
-        case Token::KEYWORD:
+        case Token::NORMAL: {
+            *font = &global.regular;
+        } break;
+        case Token::KEYWORD: {
             color = global.keyword_color;
-            break;
-        case Token::COMMENT:
+            *font = &global.bold;
+        } break;
+        case Token::COMMENT: {
             color = global.comment_color;
-            break;
-        case Token::STRING:
+            *font = &global.italic;
+        } break;
+        case Token::STRING: {
+            *font = &global.regular;
             color = global.string_color;
-            break;
+        } break;
+        case Token::NUMBER: {
+            *font = &global.regular;
+            color = global.number_color;
+        } break;
     }
 
     return color;
@@ -1542,20 +1838,20 @@ void draw(Global &g, Events::Draw &e) {
     }
 
     ui::Layout layout(talloc, {{0, 0}, WM::get_main_window()->get_size()});
-    const float line_percent = 1 - (g.font.size * g.line_spacing * 2) / WM::get_main_window()->get_height();
+    const float line_percent = 1 - (g.regular.size * g.line_spacing * 2) / WM::get_main_window()->get_height();
 
     { // bottom status line
         Rect2 rect = layout.push_percent(ui::BOTTOM, line_percent, 1 - line_percent);
         Renderer2D::from(e.renderers[0])->set_scissor(rect);
 
         StrView msg = tprint("%:%:%", buf->file, buf->position.y + 1, buf->position.x + 1);
-        ui::label(e.renderers[0], g.font, rect, msg, g.theme.primary, ui::RIGHT);
-        ui::label(e.renderers[0], g.font, rect, g.compile_command.is_empty() ? "no compile command" : g.compile_command, g.theme.muted, ui::CENTER);
+        ui::label(e.renderers[0], g.regular, rect, msg, g.theme.primary, ui::RIGHT);
+        ui::label(e.renderers[0], g.regular, rect, g.compile_command.is_empty() ? "no compile command" : g.compile_command, g.theme.muted, ui::CENTER);
         
         if (g.bindings == VIM_BINDINGS) {
-            ui::label(e.renderers[0], g.font, rect, tprint("Vim: % %", vim_mode_to_string(g.vim_mode), g.command), g.theme.muted, ui::LEFT);
+            ui::label(e.renderers[0], g.regular, rect, tprint("Vim: % %", vim_mode_to_string(g.vim_mode), g.command), g.theme.muted, ui::LEFT);
         } else if (g.bindings == MOUSE_BINDINGS) {
-            ui::label(e.renderers[0], g.font, rect, "Mouse", g.theme.muted, ui::LEFT);
+            ui::label(e.renderers[0], g.regular, rect, "Mouse", g.theme.muted, ui::LEFT);
         }
 
         layout.pop();
@@ -1570,60 +1866,66 @@ void draw(Global &g, Events::Draw &e) {
         StrView max_number = tprint(line_number_fmt, buf->lines.size());
 
         Vector2 pos = layout.currrent().top_left();
-        g.font.measure(pos, max_number);
+        g.regular.measure(pos, max_number);
 
         float x = pos.x;
-        pos.y -= g.font.size;
+        pos.y -= g.regular.size;
 
         if (buf->lines.is_empty() || (buf->lines.size() == 1 && buf->lines[0].size() == 0)) {
             Vector2 pos_copy = pos;
-            g.font.immediate_draw(e.renderers[0], pos_copy, "  empty file", g.theme.muted);
+            g.regular.immediate_draw(e.renderers[0], pos_copy, "  empty file", g.theme.muted);
         }
 
 
-        { // selection 
-            // TODO: this seems painfully slow. 
-            buf->copied_flash.tick_down();
-            if (buf->selection_start != Vector2i(-1, -1) || !buf->copied_flash.is_finished()) {
-                Color selection_color = g.theme.muted;
-                selection_color.a = 0.75;
-                if (!buf->copied_flash.is_finished()) {
-                    selection_color = *g.theme.named_colors.get("theme_orange");
+        {
+
+            { // Camera movement
+                int cam_move = 0;
+                int visable_rows = math::floor(rect.size.y / (g.regular.size * g.line_spacing));
+                int offset = buf->position.y - buf->cam_offset;
+
+                if (offset <= SCROLL_OFF && visable_rows - offset <= SCROLL_OFF) {
+                    cam_move = 0;
+                } else if (offset < SCROLL_OFF) {
+                    cam_move = -(SCROLL_OFF - offset);
+                } else if (visable_rows - offset < SCROLL_OFF) {
+                    cam_move = SCROLL_OFF - (visable_rows - offset);
                 }
 
-                Vector2 selection_pos = pos;
-                for (int y = buf->cam_offset; y < buf->lines.size(); ++y) {
-                    Rect2DCmd cmd{selection_pos, {g.font.metrics[0].advance.x, g.font.size * g.line_spacing}, selection_color};
-                    cmd.position.y -= g.font.size * (g.line_spacing - 1);
+                buf->cam_offset = math::CLAMPED(buf->cam_offset + cam_move, 0, (int) buf->lines.size() - 1);
+            }
 
-                    for (int x = 0; x <= buf->lines[y].size(); ++x) {
-                        if (buf->is_selected({x, y}) || Buffer::is_pos_between({x, y}, buf->copied_flash_position, buf->copied_flash_start)) {
-                            cmd.immediate_draw(e.renderers[0]);
+            { // selection 
+                // TODO: this seems painfully slow. 
+                buf->copied_flash.tick_down();
+                if (buf->selection_start != Vector2i(-1, -1) || !buf->copied_flash.is_finished()) {
+                    Color selection_color = g.theme.muted;
+                    selection_color.a = 0.75;
+                    if (!buf->copied_flash.is_finished()) {
+                        selection_color = *g.theme.named_colors.get("theme_orange");
+                    }
+
+                    Vector2 selection_pos = pos;
+                    for (int y = buf->cam_offset; y < buf->lines.size(); ++y) {
+                        Rect2DCmd cmd{selection_pos, {g.regular.metrics[0].advance.x, g.regular.size * g.line_spacing}, selection_color};
+                        cmd.position.y -= g.regular.size * (g.line_spacing - 1);
+
+                        for (int x = 0; x <= buf->lines[y].size(); ++x) {
+                            if (buf->is_selected({x, y}) || Buffer::is_pos_between({x, y}, buf->copied_flash_position, buf->copied_flash_start)) {
+                                cmd.immediate_draw(e.renderers[0]);
+                            }
+                            cmd.position.x += cmd.size.x;
                         }
-                        cmd.position.x += cmd.size.x;
-                    }
 
-                    selection_pos.y -= g.font.size * g.line_spacing;
-                    if (selection_pos.y < -global.font.size) {
-                        break;
+                        selection_pos.y -= g.regular.size * g.line_spacing;
+                        if (selection_pos.y < -global.regular.size) {
+                            break;
+                        }
                     }
+                } else {
+                    buf->copied_flash_position = Vector2i(-1, -1);
                 }
-            } else {
-                buf->copied_flash_position = Vector2i(-1, -1);
             }
-        }
-
-        { // Camera movement
-            int cam_move = 0;
-            int visable_rows = math::floor(rect.size.y / (g.font.size * g.line_spacing));
-            int offset = buf->position.y - buf->cam_offset;
-            if (offset < SCROLL_OFF) {
-                cam_move = -(SCROLL_OFF - offset);
-            } else if (visable_rows - offset < SCROLL_OFF) {
-                cam_move = SCROLL_OFF - (visable_rows - offset);
-            }
-
-            buf->cam_offset = math::CLAMPED(buf->cam_offset + cam_move, 0, (int) buf->lines.size() - 1);
         }
 
         u64 token_index = 0;
@@ -1631,9 +1933,9 @@ void draw(Global &g, Events::Draw &e) {
         for (u64 i = buf->cam_offset; i < buf->lines.size(); ++i) {
             Vector2 line_pos(rect.position.x, pos.y);
             if (buf->position.y == i) {
-                g.font.immediate_draw(e.renderers[0], line_pos, tprint(line_number_fmt, i + 1), *g.theme.named_colors.get("theme_purple"));
+                g.regular.immediate_draw(e.renderers[0], line_pos, tprint(line_number_fmt, i + 1), *g.theme.named_colors.get("theme_purple"));
             } else {
-                g.font.immediate_draw(e.renderers[0], line_pos, tprint(line_number_fmt, math::abs((int) buf->position.y - (int) i)), g.theme.muted);
+                g.regular.immediate_draw(e.renderers[0], line_pos, tprint(line_number_fmt, math::abs((int) buf->position.y - (int) i)), g.theme.muted);
             }
 
             while (token_index < buf->tokens.size() && buf->tokens[token_index].end_line < i) {
@@ -1641,40 +1943,40 @@ void draw(Global &g, Events::Draw &e) {
             }
 
             for (u64 j = 0; j < buf->lines[i].size(); ++j) {
-                Color color = get_color(*buf, token_index, i, j);
+                FreeFont *font = &g.regular;
+                Color color = get_color(*buf, &font, token_index, i, j);
 
                 // Move to the next token if we've reached the end of the current one
                 if (token_index < buf->tokens.size() && i == buf->tokens[token_index].end_line && j == buf->tokens[token_index].end - 1) {
                     token_index++;
                 }
 
-                // if (buf->is_selected({(int) i, (int) j})){
-                //
-                // } 
+                // TODO: maybe here would be a more convienient place to put the selection
+                // if (buf->is_selected({(int) i, (int) j}))
 
                 if (i == buf->position.y && j == buf->x()) {
-                    Rect2DCmd cmd{pos, {g.font.metrics[0].advance.x, g.font.size * g.line_spacing}, g.theme.primary};
-                    cmd.position.y -= g.font.size * (g.line_spacing - 1);
+                    Rect2DCmd cmd{pos, {font->metrics[0].advance.x, font->size * g.line_spacing}, g.theme.primary};
+                    cmd.position.y -= font->size * (g.line_spacing - 1);
                     cmd.color = color;
 
                     cmd.immediate_draw(e.renderers[0]);
-                    g.font.immediate_draw(e.renderers[0], pos, buf->lines[i].substr(j, 1), g.theme.secondary);
+                    font->immediate_draw(e.renderers[0], pos, buf->lines[i].substr(j, 1), g.theme.secondary);
                 } else {
-                    g.font.immediate_draw(e.renderers[0], pos, buf->lines[i].substr(j, 1), color);
+                    font->immediate_draw(e.renderers[0], pos, buf->lines[i].substr(j, 1), color);
                 }
             }
 
             if (buf->position.y == i && buf->x() >= buf->lines[i].size()) {
-                Rect2DCmd cmd{pos, {g.font.metrics[0].advance.x, g.font.size * g.line_spacing}, g.theme.primary};
-                cmd.position.y -= g.font.size * (g.line_spacing - 1);
+                Rect2DCmd cmd{pos, {g.regular.metrics[0].advance.x, g.regular.size * g.line_spacing}, g.theme.primary};
+                cmd.position.y -= g.regular.size * (g.line_spacing - 1);
 
                 cmd.immediate_draw(e.renderers[0]);
             }
 
             pos.x = x;
-            pos.y -= g.font.size * g.line_spacing;
+            pos.y -= g.regular.size * g.line_spacing;
 
-            if (pos.y < -global.font.size) {
+            if (pos.y < -global.regular.size) {
                 break;
             }
         }
@@ -1696,8 +1998,8 @@ void draw(Global &g, Events::Draw &e) {
                 continue;
             }
 
-            Vector2 size(pad * 2, g.font.size * g.line_spacing + pad);
-            g.font.measure(size, it.text);
+            Vector2 size(pad * 2, g.regular.size * g.line_spacing + pad);
+            g.regular.measure(size, it.text);
 
             Vector2 position = rect.top_right() - size;
 
@@ -1711,7 +2013,7 @@ void draw(Global &g, Events::Draw &e) {
 
             Renderer2D::from(e.renderers[0])->set_scissor(rect);
             ClearScreen2DCmd{g.theme.muted}.immediate_draw(e.renderers[0]);
-            ui::label(e.renderers[0], g.font, rect, it.text, *g.theme.named_colors.get("theme_red"), ui::CENTER);
+            ui::label(e.renderers[0], g.regular, rect, it.text, *g.theme.named_colors.get("theme_red"), ui::CENTER);
 
             rect.position.y -= rect.size.y + pad;
         }
@@ -1723,9 +2025,9 @@ void draw(Global &g, Events::Draw &e) {
     if (!g.buffers[g.buffer_index].prompt.is_empty()) {
         buf = &g.buffers[g.buffer_index];
 
-        Vector2 size(pad * 2, g.font.size * g.line_spacing + pad);
-        g.font.measure(size, buf->prompt);
-        g.font.measure(size, buf->line());
+        Vector2 size(pad * 2, g.regular.size * g.line_spacing + pad);
+        g.regular.measure(size, buf->prompt);
+        g.regular.measure(size, buf->line());
 
         Rect2 rect = layout.push_percent(ui::CENTER, 0, 0);
         rect.position -= size / 2;
@@ -1735,8 +2037,8 @@ void draw(Global &g, Events::Draw &e) {
         ClearScreen2DCmd{g.theme.muted}.immediate_draw(e.renderers[0]);
 
         Vector2 position = rect.position + Vector2(pad);
-        g.font.immediate_draw(e.renderers[0], position, buf->prompt, g.theme.primary);
-        g.font.immediate_draw(e.renderers[0], position, buf->line(), g.theme.primary);
+        g.regular.immediate_draw(e.renderers[0], position, buf->prompt, g.theme.primary);
+        g.regular.immediate_draw(e.renderers[0], position, buf->line(), g.theme.primary);
     }
 }
 

@@ -1,5 +1,0 @@
-starting application
-[Engine] C:\Users\joveb\source\repos\NewJovialEngine\src\Window.cpp:135: [1m[32mInfo: [0mCreating linux window 'Lovial Editor' of size (1280, 720)
-[Engine] C:\Users\joveb\source\repos\NewJovialEngine\src\rendering\2d\Text.cpp:402: [1m[32mInfo: [0mSuccessfully initailized freetype!
-[Engine] C:\Users\joveb\source\repos\NewJovialEngine\src\os\FileAccess.cpp:135: [1m[31mError: [0mCould not open directory ".": No error
-[Engine] C:\Users\joveb\source\repos\NewJovialEngine\src\os\FileAccess.cpp:135: [1m[31mError: [0mCould not open directory ".": No error
