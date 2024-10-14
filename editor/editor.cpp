@@ -420,7 +420,9 @@ struct Buffer {
     Tokenizer *tokenizer;
 
     String file;
+
     String search;
+    DArray<Vector2i> search_positions;
 
     Vector2i selection_start = Vector2i(-1, -1);
     bool select_lines = false;
@@ -437,10 +439,11 @@ struct Buffer {
     bool broken_edit = true;
 
     enum Flags {
-        READ_ONLY        = 1 << 0,
-        DIRECTORY        = 1 << 1,
-        NEEDS_RETOKENIZE = 1 << 2,
-        MODIFIED         = 1 << 3,
+        READ_ONLY         = 1 << 0,
+        DIRECTORY         = 1 << 1,
+        NEEDS_RETOKENIZE  = 1 << 2,
+        MODIFIED          = 1 << 3,
+        UNSAVED           = 1 << 4,
     };
 
     int flags = 0;
@@ -457,7 +460,7 @@ struct Buffer {
 
     void save() {
         fs::write_file(file, lines_to_string(talloc, lines));
-        flags &= ~MODIFIED;
+        flags &= ~UNSAVED;
     }
 
     void paste() {
@@ -505,27 +508,28 @@ struct Buffer {
         }
 
         int indent = 0;
-        for (u64 i = 0; i < line; ++i) {
-            int offset = 0;
+        for (u64 i = 0; i <= line; ++i) {
             for (u64 j = 0; j < opens.size(); ++j) {
+                int offset = 0;
                 while (true) {
-                    int new_offset = lines[i].find(opens[j], offset);
-                    if (new_offset == -1) {
+                    offset = lines[i].find(opens[j], offset);
+                    if (offset == -1) {
                         break;
                     } else {
-                        offset = math::max(offset, new_offset + 1);
-                        indent = math::max(indent + 1, 0);
+                        offset += 1;
+                        indent += 1;
                         if (offset >= lines[i].size()) break;
                     }
                 }
             }
             for (u64 j = 0; j < closes.size(); ++j) {
+                int offset = 0;
                 while (true) {
-                    int new_offset = lines[i].find(closes[j], offset);
-                    if (new_offset == -1) {
+                    offset = lines[i].find(closes[j], offset);
+                    if (offset == -1) {
                         break;
                     } else {
-                        offset = math::max(offset, new_offset + 1);
+                        offset = math::max(offset, offset + 1);
                         indent = math::max(indent - 1, 0);
                         if (offset >= lines[i].size()) break;
                     }
@@ -681,17 +685,14 @@ struct Buffer {
         if (c == '{' && x() >= line().size()) {
             insert(c);
             Vector2i pos = position;
-            broken_edit = true;
             insert('}');
             broken_edit = true;
             position = pos;
         } else if (c == '\n' && x() > 0 && x() < line().size() && line()[x()] == '}') {
-            insert(c);
+            insert(c, 1);
             Vector2i pos = position;
+            insert(c);
             broken_edit = true;
-            insert(c, -1);
-            broken_edit = true;
-            position = pos;
         } else {
             insert(c);
         }
@@ -796,24 +797,7 @@ struct Buffer {
 
         flags |= NEEDS_RETOKENIZE;
         flags |= MODIFIED;
-
-        // // TODO: delete entire lines where possible
-        // if (selection_start != Vector2i(-1, -1)) {
-        //     Vector2i start = is_pos_less_or_equal(selection_start, position) ? selection_start : position;
-        //     Vector2i end = is_pos_less_or_equal(selection_start, position) ? position : selection_start;
-        //
-        //     selection_start = Vector2i(-1, -1);
-        //
-        //     while (is_pos_less_or_equal(start, end)) {
-        //         end = remove_at(end);
-        //         end.x -= 1;
-        //     }
-        //     // TODO: shouldn't this not be necessary
-        //     remove_at(start);
-        //
-        //     position = old_position;
-        //     return start;
-        // }
+        flags |= UNSAVED;
 
         if (x() < 0 || line().size() == 0) {
             if (position.y > 0) {
@@ -979,8 +963,9 @@ struct Buffer {
             return;
         }
 
-        flags |= MODIFIED;
+        flags |= UNSAVED;
         flags |= NEEDS_RETOKENIZE;
+        flags |= MODIFIED;
 
         if (selection_start != Vector2i(-1, -1)) {
             position = remove_at(position);
@@ -1103,13 +1088,47 @@ struct Buffer {
         }
     }
 
+    void find_search() {
+        search_positions.free();
+        search_positions = {};
+
+        for (int i = 0; i < lines.size(); ++i) {
+            int offset = 0;
+            while (true) {
+                offset = lines[i].find(search, offset);
+                if (offset == -1) {
+                    break;
+                } else {
+                    search_positions.push(halloc, {offset, i});
+                    offset += 1;
+                    if (offset >= lines[i].size()) break;
+                }
+            }
+        }
+    }
+
+    void goto_next_search() {
+        if (search_positions.is_empty()) return;
+
+        for (int i = 0; i < search_positions.size(); ++i) {
+            if (is_pos_less(position, search_positions[i])) {
+                position = search_positions[i];
+                return;
+            }
+        }
+
+        position = search_positions[0];
+    }
+
     void free() {
         for (auto &line: lines) {
             line.free();
         }
         lines.free();
         file.free();
+
         search.free();
+        search_positions.free();
 
         for (auto &edit: history) {
             edit.free();
@@ -1143,6 +1162,9 @@ struct Global {
     Color string_color;
     Color number_color;
     Color punct_color;
+
+    Color selection_color;
+    Color bright_selection_color;
 
     OwnedDArray<Buffer> buffers;
 
@@ -1289,6 +1311,11 @@ struct Global {
         keyword_color = Color::hex(0xd8a657ff);
         comment_color = Color::hex(0x7c6f64ff);
         punct_color = Color::hex(0xcc7d49ff);
+
+        selection_color = theme.muted;
+        selection_color.a = 0.75;
+
+        bright_selection_color = Color::hex(0xcc7d49ff);
     }
 
     void compile() {
@@ -1393,8 +1420,11 @@ void cmd(Buffer &buffer) {
 }
 
 void search(Buffer &buffer) {
-    if (global.last_buffer()) {
-        global.last_buffer()->search = String(halloc, buffer.line());
+    auto *lb = global.last_buffer();
+    if (lb) {
+        lb->search.free();
+        lb->search = String(halloc, buffer.line());
+        lb->flags |= Buffer::MODIFIED;
     }
     global.vim_mode = VimNormal;
     global.close_current_buffer();
@@ -1508,6 +1538,11 @@ const VimMotion VIM_MOTIONS[] = {
 
     {VimNormal | VimVisual | VimVisualLine, "G", [](Buffer &buf, StrView rest) {
 		buf.move_y(buf.lines.size()); 
+        return true;
+	}},
+
+    {VimNormal | VimVisual | VimVisualLine, "n", [](Buffer &buf, StrView rest) {
+        buf.goto_next_search();
         return true;
 	}},
 
@@ -1636,6 +1671,15 @@ StrView vim_move(StrView cmd, bool no_flush = false) {
 void update_buffer(Global &g, Events::Update &event) {
     Buffer *buf = g.current_buffer();
     if (!buf) return;
+
+    if (buf->flags & Buffer::MODIFIED) {
+        if (!buf->search.is_empty()) {
+            buf->find_search();
+            buf->goto_next_search();
+        }
+        
+        buf->flags &= ~Buffer::MODIFIED;
+    }
 
     if (buf->tokenizer) {
         if (!buf->tokenizer->already_done && buf->tokenizer->done.load()) {
@@ -1977,8 +2021,8 @@ void draw(Global &g, Events::Draw &e) {
         Rect2 rect = layout.push_percent(ui::BOTTOM, line_percent, 1 - line_percent);
         Renderer2D::from(e.renderers[0])->set_scissor(rect);
 
-        StrView modified = buf->flags & Buffer::MODIFIED ? "[+] " : "";
-        StrView msg = tprint("%%:%:%", modified, buf->file, buf->position.y + 1, buf->x() + 1);
+        StrView unsaved = buf->flags & Buffer::UNSAVED ? "[+] " : "";
+        StrView msg = tprint("%%:%:%", unsaved, buf->file, buf->position.y + 1, buf->x() + 1);
         ui::label(e.renderers[0], g.regular, rect, msg, g.theme.primary, ui::RIGHT);
         ui::label(e.renderers[0], g.regular, rect, g.compile_command.is_empty() ? "no compile command" : g.compile_command, g.theme.muted, ui::CENTER);
         
@@ -2033,10 +2077,9 @@ void draw(Global &g, Events::Draw &e) {
                 // TODO: this seems painfully slow. 
                 buf->copied_flash.tick_down();
                 if (buf->selection_start != Vector2i(-1, -1) || !buf->copied_flash.is_finished()) {
-                    Color selection_color = g.theme.muted;
-                    selection_color.a = 0.75;
+                    Color selection_color = g.selection_color;
                     if (!buf->copied_flash.is_finished()) {
-                        selection_color = *g.theme.named_colors.get("theme_orange");
+                        selection_color = g.bright_selection_color;
                     }
 
                     Vector2 selection_pos = pos;
@@ -2088,12 +2131,27 @@ void draw(Global &g, Events::Draw &e) {
                 // TODO: maybe here would be a more convienient place to put the selection
                 // if (buf->is_selected({(int) i, (int) j}))
 
+                bool inverted = false;
+                for (const auto &search_pos: buf->search_positions) {
+                    if (search_pos.y == i) {
+                        if ((int) j - search_pos.x >= 0 && (int) j - search_pos.x < buf->search.size()) {
+                            Rect2DCmd cmd{pos, {font->metrics[0].advance.x, font->size * g.line_spacing}, g.bright_selection_color};
+                            cmd.position.y -= font->size * (g.line_spacing - 1);
+                            cmd.immediate_draw(e.renderers[0]);
+                            inverted = true;
+                        }
+                    }
+                }
+
                 if (i == buf->position.y && j == buf->x()) {
-                    Rect2DCmd cmd{pos, {font->metrics[0].advance.x, font->size * g.line_spacing}, g.theme.primary};
+                    Rect2DCmd cmd{pos, {font->metrics[0].advance.x, font->size * g.line_spacing}, color};
                     cmd.position.y -= font->size * (g.line_spacing - 1);
-                    cmd.color = color;
 
                     cmd.immediate_draw(e.renderers[0]);
+                    inverted = true;
+                }
+                
+                if (inverted) {
                     font->immediate_draw(e.renderers[0], pos, buf->lines[i].substr(j, 1), g.theme.secondary);
                 } else {
                     font->immediate_draw(e.renderers[0], pos, buf->lines[i].substr(j, 1), color);
