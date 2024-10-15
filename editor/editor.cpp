@@ -167,7 +167,7 @@ static const StrView LUA_KEYWORDS[] = {
 struct Tokenizer {
     std::atomic<bool> done;
     std::thread thread;
-    bool already_done = true;
+    bool already_done = false;
 
     DArray<Token> tokens;
     String file;
@@ -176,6 +176,10 @@ struct Tokenizer {
         CPP,
         LUA,
     } type;
+
+    Tokenizer() {
+        done.store(true);
+    }
 
     bool _handle_space(u64 &i, u64 &line, u32 &line_offset) {
         if (isspace(file[i])) {
@@ -397,6 +401,7 @@ struct Tokenizer {
 
     void tokenize(const DArray<String> &lines, StrView path) {
         StrView extension = path.get_extension();
+        push_error("extension: %s", extension.tcstr());
         if (extension == "c" || extension == "cpp") {
             type = CPP;
         } else if (extension == "lua") {
@@ -452,7 +457,7 @@ struct Buffer {
     void (*on_selected)(Buffer &);
 
     inline int x() {
-        return math::min(position.x, (int) line().size());
+        return math::MIN(position.x, (int) line().size());
     }
 
     inline String &line() {
@@ -530,8 +535,8 @@ struct Buffer {
                     if (offset == -1) {
                         break;
                     } else {
-                        offset = math::max(offset, offset + 1);
-                        indent = math::max(indent - 1, 0);
+                        offset = math::MAX(offset, offset + 1);
+                        indent = math::MAX(indent - 1, 0);
                         if (offset >= lines[i].size()) break;
                     }
                 }
@@ -672,7 +677,7 @@ struct Buffer {
         }
 
         if (c == '\n') {
-            int indent = math::max(get_indent_at(position.y) + extra_indent, 0);
+            int indent = math::MAX(get_indent_at(position.y) + extra_indent, 0);
             for (int i = 0; i < indent; ++i) {
                 for (int j = 0; j < TAB_WIDTH; ++j) {
                     insert(' ');
@@ -1269,10 +1274,10 @@ struct Global {
 
 #ifdef BUNDLE_FONT
         if (sdf) {
-            font.load_buffer(FONT_DATA, FONT_DATA_LEN, size, FreeFont::SDF);
+            regular.load_buffer(FONT_DATA, FONT_DATA_LEN, size, FreeFont::SDF);
             freetype_set_anti_aliasing_factor(SDF_AA);
         } else {
-            font.load_buffer(FONT_DATA, FONT_DATA_LEN, size, FreeFont::BITMAP);
+            regular.load_buffer(FONT_DATA, FONT_DATA_LEN, size, FreeFont::BITMAP);
             freetype_set_anti_aliasing_factor(BITMAP_AA);
         }
 #else
@@ -1820,6 +1825,7 @@ void update_buffer(Global &g, Events::Update &event) {
         }
 
         if (buf->flags & Buffer::NEEDS_RETOKENIZE && buf->tokenizer->done.load()) {
+            push_error("here");
             buf->tokenizer->tokenize(buf->lines, buf->file);
             buf->flags &= ~Buffer::NEEDS_RETOKENIZE;
         }
@@ -1919,7 +1925,6 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
 
     if (event.keycode == Actions::Escape) {
         g.recording_macro = 0;
-        return;
     }
 
     // Handle prompt-related actions
@@ -2387,7 +2392,7 @@ int main(int argc, char* argv[]) {
 
     WindowProps props{
             .size  = {1280, 720},
-            .title = "Lovial Editor",
+            .title = "Jovial Editor",
             .bg    = Colors::GRUVBOX_GREY,
     };
 
