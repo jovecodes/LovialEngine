@@ -2,7 +2,9 @@
 #define JV_FREETYPE_SUPPORT
 
 #ifdef BUNDLE_FONT
-#include "Font.h"
+#include "RegularFontData.h"
+#include "BoldFontData.h"
+#include "ItalicFontData.h"
 #endif
 
 #include "OS/Clipboard.h"
@@ -1274,10 +1276,14 @@ struct Global {
 
 #ifdef BUNDLE_FONT
         if (sdf) {
-            regular.load_buffer(FONT_DATA, FONT_DATA_LEN, size, FreeFont::SDF);
+            regular.load_buffer(__fonts_ttf_JetBrainsMono_Regular_ttf, __fonts_ttf_JetBrainsMono_Regular_ttf_len, size, FreeFont::SDF);
+            bold.load_buffer(__fonts_ttf_JetBrainsMono_Bold_ttf, __fonts_ttf_JetBrainsMono_Bold_ttf_len, size, FreeFont::SDF);
+            italic.load_buffer(__fonts_ttf_JetBrainsMono_Italic_ttf, __fonts_ttf_JetBrainsMono_Italic_ttf_len, size, FreeFont::SDF);
             freetype_set_anti_aliasing_factor(SDF_AA);
         } else {
-            regular.load_buffer(FONT_DATA, FONT_DATA_LEN, size, FreeFont::BITMAP);
+            regular.load_buffer(__fonts_ttf_JetBrainsMono_Regular_ttf, __fonts_ttf_JetBrainsMono_Regular_ttf_len, size, FreeFont::BITMAP);
+            bold.load_buffer(__fonts_ttf_JetBrainsMono_Bold_ttf, __fonts_ttf_JetBrainsMono_Bold_ttf_len, size, FreeFont::BITMAP);
+            italic.load_buffer(__fonts_ttf_JetBrainsMono_Italic_ttf, __fonts_ttf_JetBrainsMono_Italic_ttf_len, size, FreeFont::BITMAP);
             freetype_set_anti_aliasing_factor(BITMAP_AA);
         }
 #else
