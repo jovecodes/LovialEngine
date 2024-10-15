@@ -1183,8 +1183,8 @@ struct Global {
 
     float line_spacing = 1.2f;
 
-    StrView compile_command;
     Arena compile_command_arena;
+    DArray<String> compile_command;
     os::Proc game_proc;
 
     Bindings bindings = VIM_BINDINGS;
@@ -1338,7 +1338,7 @@ struct Global {
     void compile() {
         if (game_proc.is_valid()) game_proc.wait();
         os::Command command;
-        command.append(compile_command);
+        for (const auto &arg: compile_command) command.append(arg);
         game_proc = command.run_async();
     }
 
@@ -1354,7 +1354,7 @@ struct Global {
 #else 
                 sb.append(dir, "/", i);
 #endif
-                compile_command = sb.build(compile_command_arena);
+                compile_command.push(compile_command_arena, sb.build(compile_command_arena));
             }
         }
     }
@@ -1375,6 +1375,10 @@ struct Global {
         if (buffers.size() >= 2) {
             close_buffer(buffers.size() - 2);
         }
+    }
+
+    void push_compile_command_argument(StrView arg) {
+        compile_command.push(compile_command_arena, String(compile_command_arena, arg));
     }
 
     ~Global() {
@@ -1870,7 +1874,12 @@ void on_open_file(Buffer &buffer) {
 
 void set_compile_command(Buffer &buffer) {
     global.compile_command_arena.reset();
-    global.compile_command = String(global.compile_command_arena, buffer.line());
+    global.compile_command = {};
+
+    // TODO: don't split on ' ' and " "
+    for (auto v: buffer.line().view().split_spaces()) {
+        global.push_compile_command_argument(v);
+    }
     global.close_current_buffer();
 }
 
@@ -2179,7 +2188,11 @@ void draw(Global &g, Events::Draw &e) {
         StrView unsaved = buf->flags & Buffer::UNSAVED ? "[+] " : "";
         StrView msg = tprint("%%:%:%", unsaved, buf->file, buf->position.y + 1, buf->x() + 1);
         ui::label(e.renderers[0], g.regular, rect, msg, g.theme.primary, ui::RIGHT);
-        ui::label(e.renderers[0], g.regular, rect, g.compile_command.is_empty() ? "no compile command" : g.compile_command, g.theme.muted, ui::CENTER);
+
+        StrView compile_cmd = "no compile command";
+        if (!g.compile_command.is_empty()) compile_cmd = join_strings(talloc, " ", g.compile_command.view());
+        
+        ui::label(e.renderers[0], g.regular, rect, compile_cmd, g.theme.muted, ui::CENTER);
         
         if (g.recording_macro != 0) {
             ui::label(e.renderers[0], g.regular, rect, tprint("recording macro @%", g.recording_macro), g.theme.primary, ui::LEFT);
