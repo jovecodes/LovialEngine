@@ -35,6 +35,14 @@ using namespace jovial;
 
 #define STRINGIFY(s) #s
 
+#ifdef _WIN32
+#define PATH_SEP "\\"
+#define PATH_SEP_CHAR '\\'
+#else 
+#define PATH_SEP "/"
+#define PATH_SEP_CHAR '/'
+#endif
+
 enum VimMode {
     VimNormal = 1 << 0,
     VimInsert = 1 << 1,
@@ -77,7 +85,7 @@ struct Edit {
 void push_error_str(String string);
 #define push_error(...) push_error_str(auto_sprintf(__VA_ARGS__))
 
-String lines_to_string(Allocator alloc, const DArray<String> lines) {
+String lines_to_string(Allocator alloc, const DArray<String> &lines) {
     StringBuilder sb;
     for (const auto &line: lines) {
         sb.append(line);
@@ -116,6 +124,9 @@ static const StrView CPP_KEYWORDS[] = {
     CSV("case"),
     CSV("goto"),
     CSV("do"),
+
+    CSV("using"),
+    CSV("namespace"),
 
     CSV("#define"),
     CSV("#undef"),
@@ -346,7 +357,7 @@ struct Tokenizer {
             u32 start = line_offset;
             i += 1, line_offset += 1;
 
-            while (i < file.size() && ispunct(file[i]) && file[i] != '"') {
+            while (i < file.size() && ispunct(file[i]) && file[i] != '"' && file[i] != '\'') {
                 i++, line_offset++;
             }
 
@@ -403,7 +414,6 @@ struct Tokenizer {
 
     void tokenize(const DArray<String> &lines, StrView path) {
         StrView extension = path.get_extension();
-        push_error("extension: %s", extension.tcstr());
         if (extension == "c" || extension == "cpp") {
             type = CPP;
         } else if (extension == "lua") {
@@ -550,8 +560,12 @@ struct Buffer {
     void copy() {
         clipboard::set(WM::get_main_window_id(), selected_text().to_cstr(talloc));
         copied_flash.restart(0.15);
-        copied_flash_position = position;
-        copied_flash_start = selection_start;
+
+        Vector2i start = is_pos_less_or_equal(selection_start, position) ? selection_start : position;
+        Vector2i end = is_pos_less_or_equal(selection_start, position) ? position : selection_start;
+        copied_flash_position = start;
+        copied_flash_start = end;
+
         selection_start = Vector2i(-1, -1);
     }
 
@@ -851,11 +865,32 @@ struct Buffer {
     }
 
     bool is_selected(Vector2i at) {
+        if (selection_start == Vector2i(-1, -1)) {
+            return false;
+        }
+
         Vector2i start = selection_start, end = position;
 
         if (is_pos_less_or_equal(position, selection_start)) {
             start = position;
             end = selection_start;
+        }
+
+        if (select_lines) {
+            start.x = 0;
+            end.x = lines[end.y].size();
+        }
+
+        return is_pos_between(at, start, end);
+    }
+    
+    bool is_flash_selected(Vector2i at) {
+        if (copied_flash_position == Vector2i(-1, -1) || copied_flash_start == Vector2i(-1, -1)) return false;
+        Vector2i start = copied_flash_start, end = copied_flash_position;
+
+        if (is_pos_less_or_equal(copied_flash_position, copied_flash_start)) {
+            start = copied_flash_position;
+            end = copied_flash_start;
         }
 
         if (select_lines) {
@@ -1027,19 +1062,18 @@ struct Buffer {
         { // clean up the path
             println("old: %", path);
             String tfile = String(talloc, path);
-            tfile = tfile.replace_first("./", "");
-            tfile = tfile.replace("//", "/");
+            tfile = tfile.replace_first("." PATH_SEP, "");
+            tfile = tfile.replace(PATH_SEP PATH_SEP, PATH_SEP);
             
-            int index = tfile.find("/..");
+            int index = tfile.find(PATH_SEP "..");
             while (index != -1) {
-                println("index: %", index);
                 int at = index - 1;
-                for (; at > 0 && tfile[at] != '/'; --at) {
+                for (; at > 0 && tfile[at] != PATH_SEP_CHAR; --at) {
                     tfile.remove_at(at);
                 }
-                index = tfile.find("/..", index);
+                index = tfile.find(PATH_SEP "..", index);
             }
-            tfile = tfile.replace("/..", "");
+            tfile = tfile.replace(PATH_SEP "..", "");
 
             file = String(halloc, tfile);
         }
@@ -1062,8 +1096,8 @@ struct Buffer {
 
                 StringBuilder sb;
                 sb.append(files[i]);
-                auto full_path = tprint("%/%", path, files[i].view());
-                if (fs::is_directory(full_path.to_cstr(talloc))) sb.append("/");
+                auto full_path = tprint("%" PATH_SEP "%", path, files[i].view());
+                if (fs::is_directory(full_path.to_cstr(talloc))) sb.append(PATH_SEP);
                 
                 lines.push(halloc, sb.build(halloc));
             }
@@ -1347,13 +1381,9 @@ struct Global {
         String dir(talloc, ".");
         auto files = fs::read_dir(".", nullptr);
         for (const auto &i: files) {
-            if (i == "LovialEngine.exe" || i == "LovialEngine" || i == "build.jov.sh" | i == "build.jov.bat") {
+            if (i == "LovialEngine.exe" || i == "LovialEngine" || i == "build.jov.sh" || i == "build.jov.bat") {
                 StringBuilder sb;
-#ifdef _WIN32
-                sb.append(dir, "\\", i);
-#else 
-                sb.append(dir, "/", i);
-#endif
+                sb.append(dir, PATH_SEP, i);
                 compile_command = sb.build(compile_command_arena);
             }
         }
@@ -1404,6 +1434,7 @@ inline bool is_shift_pressed() {
 
 void cmd(Buffer &buffer) {
     Buffer *last = global.last_buffer();
+    if (last == nullptr) return;
     if (buffer.line().is_empty()) return;
     String &prompt = buffer.line();
 
@@ -1499,7 +1530,6 @@ void cmd(Buffer &buffer) {
             escape = false;
         }
 
-                    println("% -> %", find, replace);
         if (!confirm) {
             if (whole_file) {
                 for (int i = 0; i < last->lines.size(); ++i) {
@@ -1737,6 +1767,14 @@ const VimMotion VIM_MOTIONS[] = {
         return true;
 	}},
 
+    {VimNormal | VimVisual | VimVisualLine, " /", [](Buffer& buf, StrView rest) {
+        buf.search.free();
+        buf.search = {};
+        buf.search_positions.free();
+        buf.search_positions = {};
+        return true;
+    }},
+
     {VimNormal | VimVisual | VimVisualLine, ":", [](Buffer &buf, StrView rest) {
         global.open_prompt(":", cmd);
         return true;
@@ -1760,6 +1798,8 @@ const VimMotion VIM_MOTIONS[] = {
 
     {VimNormal, "V", [](Buffer &buf, StrView rest) {
 		buf.selection_start = buf.position;
+        buf.selection_start.x = 0;
+        buf.select_lines = true;
 		global.vim_mode = VimVisualLine;
         return true;
 	}},
@@ -1831,7 +1871,6 @@ void update_buffer(Global &g, Events::Update &event) {
         }
 
         if (buf->flags & Buffer::NEEDS_RETOKENIZE && buf->tokenizer->done.load()) {
-            push_error("here");
             buf->tokenizer->tokenize(buf->lines, buf->file);
             buf->flags &= ~Buffer::NEEDS_RETOKENIZE;
         }
@@ -1888,20 +1927,12 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
     // Handle directory-related actions
     if (buf->flags & Buffer::DIRECTORY) {
         if (event.keycode == Actions::Enter) {
-#ifdef _WIN32
-            g.open_file(tprint("%\\%", buf->file, buf->line()));
-#else
-            g.open_file(tprint("%/%", buf->file, buf->line()));
-#endif
+            g.open_file(tprint("%" PATH_SEP "%", buf->file, buf->line()));
             g.close_last_buffer();
             return;
         }
         if (event.keycode == Actions::Minus) {
-#ifdef _WIN32
-            g.open_file(tprint("%\\..", buf->file));
-#else
-            g.open_file(tprint("%/..", buf->file));
-#endif
+            g.open_file(tprint("%" PATH_SEP "..", buf->file));
             return;
         }
     }
@@ -2103,11 +2134,7 @@ void update_mouse(Global &g, Events::Update &event) {
 
     if (Input::just_double_clicked()) {
         if (buf->flags & Buffer::DIRECTORY) {
-#ifdef _WIN32
-            g.open_file(tprint("%\\%", buf->file, buf->line()));
-#else
-            g.open_file(tprint("%/%", buf->file, buf->line()));
-#endif
+            g.open_file(tprint("%" PATH_SEP "%", buf->file, buf->line()));
             g.close_last_buffer();
         }
     }
@@ -2247,7 +2274,7 @@ void draw(Global &g, Events::Draw &e) {
                         cmd.position.y -= g.regular.size * (g.line_spacing - 1);
 
                         for (int x = 0; x <= buf->lines[y].size(); ++x) {
-                            if (buf->is_selected({x, y}) || Buffer::is_pos_between({x, y}, buf->copied_flash_position, buf->copied_flash_start)) {
+                            if (buf->is_selected({x, y}) || buf->is_flash_selected({x, y})) {
                                 cmd.immediate_draw(e.renderers[0]);
                             }
                             cmd.position.x += cmd.size.x;
