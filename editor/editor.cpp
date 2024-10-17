@@ -489,6 +489,8 @@ struct Buffer {
             insert('\n');
 
             Vector2i pos = position;
+
+            if (*contents == '\n') contents++;
             for (; *contents; ++contents) insert(*contents);
             position = pos;
         } else {
@@ -517,6 +519,7 @@ struct Buffer {
             static const StrView OPENS[] = {
                 CSV("function"),
                 CSV("if"),
+                CSV("do"),
             };
             static const StrView CLOSES[] = {
                 CSV("end"),
@@ -557,14 +560,16 @@ struct Buffer {
         return indent;
     }
 
-    void copy() {
+    void copy(bool flash = true) {
         clipboard::set(WM::get_main_window_id(), selected_text().to_cstr(talloc));
-        copied_flash.restart(0.15);
+        if (flash) {
+            copied_flash.restart(0.15);
 
-        Vector2i start = is_pos_less_or_equal(selection_start, position) ? selection_start : position;
-        Vector2i end = is_pos_less_or_equal(selection_start, position) ? position : selection_start;
-        copied_flash_position = start;
-        copied_flash_start = end;
+            Vector2i start = is_pos_less_or_equal(selection_start, position) ? selection_start : position;
+            Vector2i end = is_pos_less_or_equal(selection_start, position) ? position : selection_start;
+            copied_flash_position = start;
+            copied_flash_start = end;
+        }
 
         selection_start = Vector2i(-1, -1);
     }
@@ -578,6 +583,7 @@ struct Buffer {
         if (select_lines) {
             start.x = 0;
             end.x = lines[end.y].size() - 1;
+            res.push(alloc, '\n');
         }
 
         while (is_pos_less_or_equal(start, end)) {
@@ -594,6 +600,10 @@ struct Buffer {
                 start.y += 1;
                 start.x = 0;
             }
+        }
+
+        if (select_lines) {
+            res.pop();
         }
 
         return res;
@@ -675,7 +685,7 @@ struct Buffer {
         history.push(halloc, edit);
     }
 
-    void insert(char c, int extra_indent = 0) {
+    void insert(char c) {
         if (flags & READ_ONLY) return;
         if (!prompt.is_empty() && c == '\n') {
             on_selected(*this);
@@ -691,6 +701,11 @@ struct Buffer {
             insert_char(c);
             history.back().position = position;
         }
+        broken_edit = false;
+    }
+
+    void insert_with_indent(char c, int extra_indent = 0) {
+        insert(c);
 
         if (c == '\n') {
             int indent = math::MAX(get_indent_at(position.y) + extra_indent, 0);
@@ -700,8 +715,6 @@ struct Buffer {
                 }
             }
         }
-
-        broken_edit = false;
     }
 
     void user_insert(char c) {
@@ -712,13 +725,16 @@ struct Buffer {
             broken_edit = true;
             position = pos;
         } else if (c == '\n' && x() > 0 && x() < line().size() && line()[x()] == '}') {
-            insert(c, 1);
+            insert_with_indent(c, 1);
             Vector2i pos = position;
-            insert(c);
+
+            insert_with_indent(c);
             broken_edit = true;
+            position = pos;
         } else {
-            insert(c);
+            insert_with_indent(c);
         }
+
     }
 
     char char_at(Vector2i at) {
@@ -776,11 +792,12 @@ struct Buffer {
     void backspace() {
         int _x = x();
         math::CLAMP(_x, 0, (int) line().size() - 1);
-        if (_x >= TAB_WIDTH) {
+        if (_x >= TAB_WIDTH - 1) {
             bool tab = true;
-            for (int i = 0; i < TAB_WIDTH; ++i) {
+            for (int i = 1; i < TAB_WIDTH; ++i) {
                 if (line()[_x - i] != ' ') tab = false;
             }
+            push_error("tab: %d", tab);
             if (tab) {
                 for (int i = 0; i < TAB_WIDTH - 1; ++i) {
                     _backspace();
@@ -1060,22 +1077,33 @@ struct Buffer {
         // history = halloc.array<Edit>(MAX_HISTORY);
 
         { // clean up the path
-            println("old: %", path);
-            String tfile = String(talloc, path);
-            tfile = tfile.replace_first("." PATH_SEP, "");
-            tfile = tfile.replace(PATH_SEP PATH_SEP, PATH_SEP);
-            
-            int index = tfile.find(PATH_SEP "..");
-            while (index != -1) {
-                int at = index - 1;
-                for (; at > 0 && tfile[at] != PATH_SEP_CHAR; --at) {
-                    tfile.remove_at(at);
-                }
-                index = tfile.find(PATH_SEP "..", index);
-            }
-            tfile = tfile.replace(PATH_SEP "..", "");
 
-            file = String(halloc, tfile);
+            String tfile = String(talloc, path);
+            if (tfile.size() >= 2) {
+                if (tfile[0] == '.' && tfile[1] == PATH_SEP_CHAR) {
+                    tfile.remove_at(0);
+                    tfile.remove_at(0);
+                }
+            }
+            tfile = tfile.replace(PATH_SEP PATH_SEP, PATH_SEP);  // Replace multiple path separators
+
+            int index = tfile.find(PATH_SEP "..");
+            while (index != -1 && index != 2) {
+                // Go back to the previous PATH_SEP and remove the segment
+                int at = index - 1;
+                // Ensure `at >= 0` to avoid accessing invalid index
+                while (at >= 0 && tfile[at] != PATH_SEP_CHAR) {
+                    tfile.remove_at(at--);  // Decrement after removing
+                }
+
+                // Remove the ".." and preceding separator
+                if (at >= 0) {
+                    tfile.remove_at(at--);  // Also remove the PATH_SEP_CHAR
+                }
+                index = tfile.find(PATH_SEP "..", index + 1);
+            }
+
+            file = String(halloc, tfile);  // Final assignment
         }
 
         Arena content_arena;
@@ -1155,6 +1183,19 @@ struct Buffer {
 
         for (int i = 0; i < search_positions.size(); ++i) {
             if (is_pos_less(position, search_positions[i])) {
+                position = search_positions[i];
+                return;
+            }
+        }
+
+        position = search_positions[0];
+    }
+
+    void goto_prev_search() {
+        if (search_positions.is_empty()) return;
+
+        for (int i = search_positions.size() - 1; i >= 0; --i) {
+            if (is_pos_less(search_positions[i], position)) {
                 position = search_positions[i];
                 return;
             }
@@ -1674,6 +1715,9 @@ const VimMotion VIM_MOTIONS[] = {
                     buf.position.x -= 1;
                 }
             }
+            Vector2i start = buf.selection_start;
+            buf.copy(false);
+            buf.selection_start = start;
 
             buf.backspace();
             buf.selection_start = Vector2i(-1, -1);
@@ -1717,6 +1761,19 @@ const VimMotion VIM_MOTIONS[] = {
         buf.goto_next_search();
         return true;
 	}},
+    
+    {VimNormal | VimVisual | VimVisualLine, "N", [](Buffer& buf, StrView rest) {
+        buf.goto_prev_search();
+        return true;
+    }},
+
+    {VimNormal, "x", [](Buffer& buf, StrView rest) {
+        if (!buf.line().is_empty()) {
+            buf.move_x(1);
+            buf.backspace();
+        }
+        return true;
+    }},
 
     {VimNormal | VimVisual | VimVisualLine, "o", [](Buffer &buf, StrView rest) {
 		buf.position.x = buf.line().size();
@@ -1761,10 +1818,19 @@ const VimMotion VIM_MOTIONS[] = {
 	}},
 
     {VimNormal, "dd", [](Buffer &buf, StrView rest) {
-		buf.select_line(); 
+		buf.select_line();
+        buf.copy(false);
+
+        buf.select_line();
         buf.backspace(); 
         return true;
 	}},
+
+    {VimNormal, "yy", [](Buffer& buf, StrView rest) {
+        buf.select_line();
+        buf.copy();
+        return true;
+    }},
 
     {VimNormal | VimVisual | VimVisualLine, "/", [](Buffer &buf, StrView rest) {
         global.open_prompt("/", search);
@@ -1820,6 +1886,10 @@ const VimMotion VIM_MOTIONS[] = {
 	}},
 
     {VimVisual | VimVisualLine, "d", [](Buffer &buf, StrView rest) {
+        Vector2i start = buf.selection_start;
+        buf.copy(false);
+
+        buf.selection_start = start;
 		buf.backspace();
 		global.vim_mode = VimNormal;
         return true;
