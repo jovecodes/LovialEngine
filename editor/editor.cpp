@@ -467,6 +467,7 @@ struct Buffer {
     int flags = 0;
     StrView prompt;
     void (*on_selected)(Buffer &);
+    void (*on_selected_key_pressed)(Buffer &, Events::KeyTyped &);
 
     inline int x() {
         return math::MIN(position.x, (int) line().size());
@@ -797,7 +798,6 @@ struct Buffer {
             for (int i = 1; i < TAB_WIDTH; ++i) {
                 if (line()[_x - i] != ' ') tab = false;
             }
-            push_error("tab: %d", tab);
             if (tab) {
                 for (int i = 0; i < TAB_WIDTH - 1; ++i) {
                     _backspace();
@@ -1191,6 +1191,11 @@ struct Buffer {
         position = search_positions[0];
     }
 
+    void goto_next_search_if_not_at_one() {
+        if (search_positions.has(position)) return;
+        goto_next_search();
+    }
+
     void goto_prev_search() {
         if (search_positions.is_empty()) return;
 
@@ -1316,10 +1321,11 @@ struct Global {
         set_buffer(buffers.size() - 1);
     }
 
-    void open_prompt(StrView prompt, void (*callback)(Buffer &)) {
+    void open_prompt(StrView prompt, void (*callback)(Buffer &), void (*on_press)(Buffer &, Events::KeyTyped &) = nullptr) {
         buffers.push({});
         buffers.back().prompt = prompt;
         buffers.back().on_selected = callback;
+        buffers.back().on_selected_key_pressed = on_press;
         buffers.back().lines.push(halloc, String());
         // buffers.back().history = halloc.array<Edit>(MAX_HISTORY);
         
@@ -1425,7 +1431,7 @@ struct Global {
             if (i == "LovialEngine.exe" || i == "LovialEngine" || i == "build.jov.sh" || i == "build.jov.bat") {
                 StringBuilder sb;
                 sb.append(dir, PATH_SEP, i);
-                compile_command = sb.build(compile_command_arena);
+                push_compile_command_argument(sb.build(compile_command_arena));
             }
         }
     }
@@ -1624,6 +1630,16 @@ done:
 
     global.vim_mode = VimNormal;
     global.close_current_buffer();
+}
+
+
+void search_on_press(Buffer &buffer, Events::KeyTyped &) {
+    auto *lb = global.last_buffer();
+    if (lb) {
+        lb->search.free();
+        lb->search = String(halloc, buffer.line());
+        lb->flags |= Buffer::MODIFIED;
+    }
 }
 
 void search(Buffer &buffer) {
@@ -1833,7 +1849,7 @@ const VimMotion VIM_MOTIONS[] = {
     }},
 
     {VimNormal | VimVisual | VimVisualLine, "/", [](Buffer &buf, StrView rest) {
-        global.open_prompt("/", search);
+        global.open_prompt("/", search, search_on_press);
         return true;
 	}},
 
@@ -1919,15 +1935,13 @@ StrView vim_move(StrView cmd, bool no_flush = false) {
     return cmd;
 }
 
-
-void update_buffer(Global &g, Events::Update &event) {
-    Buffer *buf = g.current_buffer();
+void update_buffer(Buffer *buf) {
     if (!buf) return;
 
     if (buf->flags & Buffer::MODIFIED) {
         if (!buf->search.is_empty()) {
             buf->find_search();
-            buf->goto_next_search();
+            buf->goto_next_search_if_not_at_one();
         }
         
         buf->flags &= ~Buffer::MODIFIED;
@@ -1951,9 +1965,23 @@ void update_buffer(Global &g, Events::Update &event) {
     }
 }
 
+void update_buffers(Global &g, Events::Update &event) {
+    Buffer *buf = g.current_buffer();
+    update_buffer(buf);
+    if (!buf->prompt.is_empty() && g.last_buffer()) {
+        update_buffer(g.last_buffer());
+    }
+}
+
 void on_typed(Global &g, Events::KeyTyped &event) {
     Buffer *buf = g.current_buffer();
     if (!buf) return;
+
+    if (!buf->prompt.is_empty()) {
+        if (g.last_buffer()) {
+            g.last_buffer()->flags |= Buffer::MODIFIED;
+        }
+    }
 
     if (g.bindings == VIM_BINDINGS) {
         g.command.push(g.command_arena, event.character);
@@ -1973,13 +2001,16 @@ void on_typed(Global &g, Events::KeyTyped &event) {
     } else {
         buf->user_insert(event.character);
     }
+
+    if (buf->on_selected_key_pressed) {
+        buf->on_selected_key_pressed(*buf, event);
+    }
 }
 
 void on_open_file(Buffer &buffer) {
     global.open_file(buffer.line());
     global.close_last_buffer();
 }
-
 
 void set_compile_command(Buffer &buffer) {
     global.compile_command_arena.reset();
@@ -2099,7 +2130,7 @@ void on_pressed(Global &g, Events::KeyPressed &event) {
                 break;
             case Actions::F:
             case Actions::Slash:
-                g.open_prompt("/", search);
+                g.open_prompt("/", search, search_on_press);
                 break;
             case Actions::K: {
                 StrView extension = buf->file.get_extension();
@@ -2360,6 +2391,13 @@ void draw(Global &g, Events::Draw &e) {
                             if (buf->is_selected({x, y}) || buf->is_flash_selected({x, y})) {
                                 cmd.immediate_draw(e.renderers[0]);
                             }
+
+                            if (cmd.position.x >= WM::get_main_window()->get_width() - g.regular.metrics[' '].advance.x) {
+                                cmd.position.x = pos.x;
+                                cmd.position.y -= g.regular.size * g.line_spacing;
+                                selection_pos.y -= g.regular.size * g.line_spacing;
+                            }
+
                             cmd.position.x += cmd.size.x;
                         }
 
@@ -2420,11 +2458,12 @@ void draw(Global &g, Events::Draw &e) {
                     inverted = true;
                 }
                 
-                if (inverted) {
-                    font->immediate_draw(e.renderers[0], pos, buf->lines[i].substr(j, 1), g.theme.secondary);
-                } else {
-                    font->immediate_draw(e.renderers[0], pos, buf->lines[i].substr(j, 1), color);
+                if (inverted) color = g.theme.secondary;
+                if (pos.x >= WM::get_main_window()->get_width() - font->metrics[' '].advance.x) {
+                    pos.x = x;
+                    pos.y -= g.regular.size * g.line_spacing;
                 }
+                font->immediate_draw(e.renderers[0], pos, buf->lines[i].substr(j, 1), color);
             }
 
             if (buf->position.y == i && buf->x() >= buf->lines[i].size()) {
@@ -2528,7 +2567,7 @@ int main(int argc, char* argv[]) {
     global.open_file(file_to_open);
 
     WindowManager::get_main_window()->get_viewport()->push_system(global, draw);
-    game.push_system(global, update_buffer);
+    game.push_system(global, update_buffers);
     game.push_system(global, on_typed);
     game.push_system(global, on_pressed);
     game.push_system(global, update_mouse);
